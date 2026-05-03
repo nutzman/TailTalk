@@ -35,14 +35,30 @@ fn enumerate_ethernet() -> Vec<String> {
     names
 }
 
-fn enumerate_serial() -> Vec<String> {
-    let mut ports = vec!["None".to_string()];
+const TASHTALK_USB_VID: u16 = 0x10c4;
+const TASHTALK_USB_PID: u16 = 0xea60;
+
+struct SerialDevice {
+    label: String,
+    path: String,
+}
+
+fn enumerate_serial() -> Vec<SerialDevice> {
+    let mut devices = Vec::new();
     if let Ok(available) = serialport::available_ports() {
         for p in available {
-            ports.push(p.port_name);
+            if let serialport::SerialPortType::UsbPort(ref info) = p.port_type {
+                if info.vid == TASHTALK_USB_VID && info.pid == TASHTALK_USB_PID {
+                    let product = info.product.as_deref().unwrap_or("TashTalk USB");
+                    devices.push(SerialDevice {
+                        label: format!("{} - {}", product, p.port_name),
+                        path: p.port_name,
+                    });
+                }
+            }
         }
     }
-    ports
+    devices
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -60,7 +76,7 @@ fn main() -> anyhow::Result<()> {
 
     // Enumerate once at startup
     let ethernet_names = enumerate_ethernet();
-    let tashtalk_names = enumerate_serial();
+    let tashtalk_devices = enumerate_serial();
 
     let eth_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
         ethernet_names
@@ -71,9 +87,8 @@ fn main() -> anyhow::Result<()> {
     .into();
 
     let tash_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
-        tashtalk_names
-            .iter()
-            .map(|s| SharedString::from(s.as_str()))
+        std::iter::once(SharedString::from("None"))
+            .chain(tashtalk_devices.iter().map(|d| SharedString::from(d.label.as_str())))
             .collect::<Vec<_>>(),
     ))
     .into();
@@ -92,7 +107,7 @@ fn main() -> anyhow::Result<()> {
     // on_start_stop: read UI state, send Start or Stop command
     let ui_weak = ui.as_weak();
     let eth_names = ethernet_names.clone();
-    let tash_names = tashtalk_names.clone();
+    let tash_devices = tashtalk_devices;
     ui.on_start_stop(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
 
@@ -107,10 +122,11 @@ fn main() -> anyhow::Result<()> {
                 .filter(|s| s.as_str() != "None")
                 .cloned();
 
-            let tashtalk = tash_names
-                .get(tash_idx)
-                .filter(|s| s.as_str() != "None")
-                .cloned();
+            // index 0 is "None"; devices start at 1
+            let tashtalk = tash_idx
+                .checked_sub(1)
+                .and_then(|i| tash_devices.get(i))
+                .map(|d| d.path.clone());
 
             if ethernet.is_none() && tashtalk.is_none() {
                 tracing::error!("At least one of Ethernet or TashTalk must be selected");
