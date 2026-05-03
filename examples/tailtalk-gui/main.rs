@@ -47,6 +47,10 @@ fn enumerate_serial() -> Vec<SerialDevice> {
     let mut devices = Vec::new();
     if let Ok(available) = serialport::available_ports() {
         for p in available {
+            #[cfg(target_os = "macos")]
+            if p.port_name.starts_with("/dev/tty.") {
+                continue;
+            }
             if let serialport::SerialPortType::UsbPort(ref info) = p.port_type {
                 if info.vid == TASHTALK_USB_VID && info.pid == TASHTALK_USB_PID {
                     let product = info.product.as_deref().unwrap_or("TashTalk USB");
