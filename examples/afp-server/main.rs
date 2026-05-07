@@ -35,8 +35,10 @@ async fn main() {
     }
     let stack = builder.build().await.expect("failed to build AppleTalk stack");
 
-    let mut afp_config = AfpServerConfig::default();
-    afp_config.volume_path = args.path.clone();
+    let afp_config = AfpServerConfig {
+        volume_path: args.path.clone(),
+        ..AfpServerConfig::default()
+    };
 
     let _afp_server = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config)
         .await

@@ -11,6 +11,7 @@ slint::include_modules!();
 enum ServerCommand {
     Start {
         server_name: String,
+        volume_name: String,
         ethernet: Option<String>,
         tashtalk: Option<String>,
         tashtalk_crc_generation: bool,
@@ -51,14 +52,15 @@ fn enumerate_serial() -> Vec<SerialDevice> {
             if p.port_name.starts_with("/dev/tty.") {
                 continue;
             }
-            if let serialport::SerialPortType::UsbPort(ref info) = p.port_type {
-                if info.vid == TASHTALK_USB_VID && info.pid == TASHTALK_USB_PID {
-                    let product = info.product.as_deref().unwrap_or("TashTalk USB");
-                    devices.push(SerialDevice {
-                        label: format!("{} - {}", product, p.port_name),
-                        path: p.port_name,
-                    });
-                }
+            if let serialport::SerialPortType::UsbPort(ref info) = p.port_type
+                && info.vid == TASHTALK_USB_VID
+                && info.pid == TASHTALK_USB_PID
+            {
+                let product = info.product.as_deref().unwrap_or("TashTalk USB");
+                devices.push(SerialDevice {
+                    label: format!("{} - {}", product, p.port_name),
+                    path: p.port_name,
+                });
             }
         }
     }
@@ -92,7 +94,11 @@ fn main() -> anyhow::Result<()> {
 
     let tash_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
         std::iter::once(SharedString::from("None"))
-            .chain(tashtalk_devices.iter().map(|d| SharedString::from(d.label.as_str())))
+            .chain(
+                tashtalk_devices
+                    .iter()
+                    .map(|d| SharedString::from(d.label.as_str())),
+            )
             .collect::<Vec<_>>(),
     ))
     .into();
@@ -145,6 +151,7 @@ fn main() -> anyhow::Result<()> {
 
             let _ = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),
+                volume_name: ui.get_volume_name().to_string(),
                 ethernet,
                 tashtalk,
                 tashtalk_crc_generation: ui.get_tashtalk_crc_generation(),
@@ -179,6 +186,7 @@ async fn server_loop(
         match cmd {
             ServerCommand::Start {
                 server_name,
+                volume_name,
                 ethernet,
                 tashtalk,
                 tashtalk_crc_generation,
@@ -193,6 +201,7 @@ async fn server_loop(
                 let ui_w = ui_weak.clone();
                 let task = tokio::spawn(run_server(
                     server_name,
+                    volume_name,
                     ethernet,
                     tashtalk,
                     tashtalk_crc_generation,
@@ -229,8 +238,10 @@ async fn server_loop(
 
 // ── AFP server task ───────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_server(
     server_name: String,
+    volume_name: String,
     ethernet: Option<String>,
     tashtalk: Option<String>,
     tashtalk_crc_generation: bool,
@@ -314,9 +325,12 @@ async fn run_server(
         }
     };
 
-    let mut afp_config = AfpServerConfig::default();
-    afp_config.volume_path = volume;
-    afp_config.server_name = server_name;
+    let afp_config = AfpServerConfig {
+        volume_path: volume,
+        volume_name,
+        server_name,
+        ..AfpServerConfig::default()
+    };
 
     let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config).await {
         Ok(s) => s,

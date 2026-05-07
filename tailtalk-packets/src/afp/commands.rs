@@ -254,22 +254,32 @@ impl FPGetSrvrInfo {
     pub fn to_bytes(&self) -> Result<Vec<u8>, AfpError> {
         let mut buf = Vec::new();
 
-        // Header size = 10 bytes (offsets + flags) + Server Name (1 + 32 bytes).
+        let mut server_name_buf = [0u8; 256];
+        let written = self.server_name.bytes(&mut server_name_buf)?;
+        let server_name_len = (written - 1).min(255);
 
-        // TODO: Do we actually need to pad this? Classic MacOS does but Inside AppleTalk does not mention it
-        const SERVER_NAME_FIELD_SIZE: u16 = 1 + 32; // length byte + 32-byte fixed field
+        // Header size = 10 bytes (offsets + flags)
+        let mut base_offset = 10 + 1 + server_name_len;
+        let mut padding_needed = 0;
+        
+        // Inside AppleTalk specifies that fields following the Server Name
+        // must be word-aligned (even byte boundary).
+        if base_offset % 2 != 0 {
+            base_offset += 1;
+            padding_needed = 1;
+        }
 
-        let mut current_offset = 10 + SERVER_NAME_FIELD_SIZE;
+        let mut current_offset = base_offset as u16;
 
         let mut variable_data = Vec::new();
 
         let mut tmp_macstr = [0u8; 256];
         let machine_type_ptr = current_offset;
         {
-            let written = self.machine_type.bytes(&mut tmp_macstr)?;
-            variable_data.extend_from_slice(&tmp_macstr[..written]);
+            let written_mt = self.machine_type.bytes(&mut tmp_macstr)?;
+            variable_data.extend_from_slice(&tmp_macstr[..written_mt]);
         }
-        current_offset = 10 + SERVER_NAME_FIELD_SIZE + variable_data.len() as u16;
+        current_offset = base_offset as u16 + variable_data.len() as u16;
 
         let afp_versions_ptr = current_offset;
         variable_data.push(self.afp_versions.len() as u8);
@@ -279,7 +289,7 @@ impl FPGetSrvrInfo {
             variable_data.push(len);
             variable_data.extend_from_slice(s.as_bytes());
         }
-        current_offset = 10 + SERVER_NAME_FIELD_SIZE + variable_data.len() as u16;
+        current_offset = base_offset as u16 + variable_data.len() as u16;
 
         let uams_ptr = current_offset;
         variable_data.push(self.uams.len() as u8);
@@ -289,7 +299,7 @@ impl FPGetSrvrInfo {
             variable_data.push(len);
             variable_data.extend_from_slice(s.as_bytes());
         }
-        current_offset = 10 + SERVER_NAME_FIELD_SIZE + variable_data.len() as u16;
+        current_offset = base_offset as u16 + variable_data.len() as u16;
 
         let volume_icon_ptr = if let Some(icon) = &self.volume_icon {
             let ptr = current_offset;
@@ -305,14 +315,13 @@ impl FPGetSrvrInfo {
         buf.extend_from_slice(&volume_icon_ptr.to_be_bytes());
         buf.extend_from_slice(&self.flags.to_be_bytes());
 
-        // Write fixed length 32-byte server name (plus length byte)
-        let written = self.server_name.bytes(&mut tmp_macstr)?;
-        let server_name_len = (written - 1).min(31);
         buf.push(server_name_len as u8);
-        buf.extend_from_slice(&tmp_macstr[1..1 + server_name_len]);
+        buf.extend_from_slice(&server_name_buf[1..1 + server_name_len]);
 
-        let padding_needed = 32 - server_name_len;
-        buf.extend(std::iter::repeat_n(0x20, padding_needed));
+        if padding_needed > 0 {
+            buf.push(0); // Pad with null byte to achieve word alignment
+        }
+
         buf.extend_from_slice(&variable_data);
 
         Ok(buf)

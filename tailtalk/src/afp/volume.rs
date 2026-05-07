@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use tailtalk_packets::afp::{
-    AfpError, CreateFlag, FPAccessRights, FPByteRangeLockFlags, FPDelete, FPDirectoryBitmap,
-    FPEnumerate, FPFileBitmap, FPRead, FPSetForkParms, FPVolume, FPVolumeBitmap, FileType,
-    ForkType, VolumeSignature,
+    AfpError, CreateFlag, FPByteRangeLockFlags, FPDelete, FPDirectoryBitmap, FPEnumerate,
+    FPFileBitmap, FPRead, FPSetForkParms, FPVolume, FPVolumeBitmap, FileType, ForkType,
+    VolumeSignature,
 };
 
-use crate::{time_to_afp, time_to_afp_v1};
-use tracing::error;
+use crate::time_to_afp_v1;
+use tracing::{error, info};
 use xattr;
 
 /// Extended attribute name for the 32-byte Finder Info blob.
@@ -90,20 +90,16 @@ impl Node {
         })
     }
 
-    /// Get AFP Attributes from Finder Info (e.g. Invisible bit)
+    /// Get AFP file/dir attributes derived from the Finder Info xattr.
+    /// Bit 0 (Invisible) maps to fdFlags bit 14 (kIsInvisible, 0x4000).
     pub fn get_attributes(&self, volume_root: &Path) -> u16 {
         let finder_info = self.get_finder_info(volume_root);
-        // fdFlags is at offset 8 (u16 big endian) in FInfo (first 16 bytes)
-        // Bit 14 of fdFlags is kIsInvisible (0x4000)
         let fd_flags = u16::from_be_bytes([finder_info[8], finder_info[9]]);
-
-        let mut attributes = 0;
-        // Map kIsInvisible (0x4000) to AFP Attribute Invisible (Bit 0, 0x0001)
-        if (fd_flags & 0x4000) != 0 {
-            attributes |= 1;
+        let mut attrs: u16 = 0;
+        if fd_flags & 0x4000 != 0 {
+            attrs |= 0x0001; // Invisible
         }
-
-        attributes
+        attrs
     }
 
     /// Set AFP Attributes by updating Finder Info (e.g. Invisible bit)
@@ -132,7 +128,6 @@ impl Node {
         volume_root: &Path,
         bitmap: FPFileBitmap,
         output: &mut [u8],
-        afp_v2: bool,
     ) -> Result<usize, AfpError> {
         let mut offset = 0;
         let mut variable_len_offset = 0;
@@ -154,29 +149,19 @@ impl Node {
         }
 
         if bitmap.contains(FPFileBitmap::CREATE_DATE) {
-            let created_at_bytes = if afp_v2 {
-                time_to_afp(metadata.created().unwrap())
-            } else {
-                time_to_afp_v1(metadata.created().unwrap())
-            }
-            .to_be_bytes();
+            let created_at_bytes = time_to_afp_v1(metadata.created().unwrap()).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&created_at_bytes);
             offset += 4;
         }
 
         if bitmap.contains(FPFileBitmap::MODIFICATION_DATE) {
-            let modified_at_bytes = if afp_v2 {
-                time_to_afp(metadata.modified().unwrap())
-            } else {
-                time_to_afp_v1(metadata.modified().unwrap())
-            }
-            .to_be_bytes();
+            let modified_at_bytes = time_to_afp_v1(metadata.modified().unwrap()).to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&modified_at_bytes);
             offset += 4;
         }
 
         if bitmap.contains(FPFileBitmap::BACKUP_DATE) {
-            output[offset..offset + 4].copy_from_slice(&0x80000000u32.to_be_bytes());
+            output[offset..offset + 4].copy_from_slice(&0u32.to_be_bytes());
             offset += 4;
         }
 
@@ -237,9 +222,6 @@ pub struct Volume {
     created_at: u32,
     /// The ID of this volume. This is used for all AFP requests to identify this volume.
     volume_id: u16,
-    /// Whether the session negotiated AFP 2.x (true) or AFP 1.x (false).
-    /// AFP 2.x uses seconds since Jan 1, 2000; AFP 1.x uses seconds since Jan 1, 1904.
-    afp_v2: bool,
     nodes: HashMap<u32, Node>,
     path_to_id: HashMap<PathBuf, u32>,
     next_id: u32,
@@ -254,8 +236,12 @@ pub struct Volume {
 /// e.g. volume_root=`/vol`, relative_path=`atestdir/myfile`
 ///   → `/vol/.tailtalk/rsrc/atestdir/myfile`
 pub fn rsrc_path(volume_root: &Path, relative_path: &Path) -> PathBuf {
-    volume_root.join(".tailtalk").join("rsrc").join(relative_path)
+    volume_root
+        .join(".tailtalk")
+        .join("rsrc")
+        .join(relative_path)
 }
+
 
 /// Returns true if `path` represents an AFP empty path — either a zero-length OS string
 /// or one composed entirely of null bytes (the AFP wire encoding for "this node itself").
@@ -268,17 +254,12 @@ fn afp_path_is_empty(path: &Path) -> bool {
 }
 
 impl Volume {
-    pub async fn new(name: String, path: PathBuf, volume_id: u16, afp_v2: bool) -> Self {
-        let created_at = if afp_v2 {
-            time_to_afp(SystemTime::now())
-        } else {
-            time_to_afp_v1(SystemTime::now())
-        };
+    pub async fn new(name: String, path: PathBuf, volume_id: u16) -> Self {
+        let created_at = time_to_afp_v1(SystemTime::now());
         let mut new_self = Self {
             name,
             path,
             created_at,
-            afp_v2,
             volume_id,
             nodes: HashMap::new(),
             path_to_id: HashMap::new(),
@@ -315,6 +296,9 @@ impl Volume {
         new_self.nodes.insert(2, root_node);
         new_self.path_to_id.insert(PathBuf::new(), 2);
 
+        // Ensure .tailtalk exists so the root offspring count is never zero at mount time.
+        let _ = tokio::fs::create_dir_all(new_self.path.join(".tailtalk")).await;
+
         new_self.walk_dir(PathBuf::new()).await.unwrap();
         new_self
     }
@@ -343,6 +327,7 @@ impl Volume {
     /// An empty or all-null path is the AFP identity case: returns directory_id itself.
     /// ID 1 is the virtual parent-of-root and is handled specially per the AFP spec.
     pub fn resolve_node(&self, directory_id: u32, path_name: &Path) -> Result<u32, AfpError> {
+        let directory_id = if directory_id == 0 { 2 } else { directory_id };
         let is_empty = afp_path_is_empty(path_name);
 
         // ID 1 is the virtual parent-of-root, not a real filesystem node.
@@ -353,6 +338,10 @@ impl Volume {
             if path_name == Path::new(&self.name) {
                 return Ok(2);
             }
+            info!(
+                "resolve_node failed (dir_id=1): path={:?} != volume_name={:?}",
+                path_name, self.name
+            );
             return Err(AfpError::ObjectNotFound);
         }
 
@@ -361,17 +350,29 @@ impl Volume {
             return if self.nodes.contains_key(&directory_id) {
                 Ok(directory_id)
             } else {
+                info!(
+                    "resolve_node failed (empty path): dir_id={} not found",
+                    directory_id
+                );
                 Err(AfpError::ObjectNotFound)
             };
         }
 
-        let base_path = self
-            .get_node_path(directory_id)
-            .ok_or(AfpError::ObjectNotFound)?;
-        self.path_to_id
-            .get(&base_path.join(path_name))
-            .copied()
-            .ok_or(AfpError::ObjectNotFound)
+        let base_path = self.get_node_path(directory_id).ok_or_else(|| {
+            info!(
+                "resolve_node failed: base dir_id={} not found",
+                directory_id
+            );
+            AfpError::ObjectNotFound
+        })?;
+        let full_path = base_path.join(path_name);
+        self.path_to_id.get(&full_path).copied().ok_or_else(|| {
+            info!(
+                "resolve_node failed: dir_id={}, path={:?} (resolved to {:?}) not found",
+                directory_id, path_name, full_path
+            );
+            AfpError::ObjectNotFound
+        })
     }
 
     /// Get unified parameters for a node (file or directory).
@@ -400,13 +401,17 @@ impl Volume {
     }
 
     /// Set parameters for a node (file or directory).
-    pub fn set_node_parms(
+    pub async fn set_node_parms(
         &mut self,
         node_id: u32,
         file_bitmap: FPFileBitmap,
         dir_bitmap: FPDirectoryBitmap,
         data: &[u8],
     ) -> Result<(), AfpError> {
+        if node_id == 1 {
+            return Err(AfpError::ObjectNotFound);
+        }
+
         // We need volume_root for xattr operations
         let volume_root = self.path.clone();
 
@@ -429,6 +434,36 @@ impl Volume {
             let attributes = u16::from_be_bytes([data[offset], data[offset + 1]]);
             node.set_attributes(&volume_root, attributes)?;
             offset += 2;
+        }
+
+        // Bit 2: Create Date (4 bytes) — skip, not applied
+        let has_create_date = if is_dir {
+            dir_bitmap.contains(FPDirectoryBitmap::CREATE_DATE)
+        } else {
+            file_bitmap.contains(FPFileBitmap::CREATE_DATE)
+        };
+        if has_create_date {
+            offset += 4;
+        }
+
+        // Bit 3: Modification Date (4 bytes) — skip, not applied
+        let has_mod_date = if is_dir {
+            dir_bitmap.contains(FPDirectoryBitmap::MODIFICATION_DATE)
+        } else {
+            file_bitmap.contains(FPFileBitmap::MODIFICATION_DATE)
+        };
+        if has_mod_date {
+            offset += 4;
+        }
+
+        // Bit 4: Backup Date (4 bytes) — skip, not applied
+        let has_backup_date = if is_dir {
+            dir_bitmap.contains(FPDirectoryBitmap::BACKUP_DATE)
+        } else {
+            file_bitmap.contains(FPFileBitmap::BACKUP_DATE)
+        };
+        if has_backup_date {
+            offset += 4;
         }
 
         // Handle Finder Info (Bit 5) — same bit position in both bitmaps
@@ -596,7 +631,7 @@ impl Volume {
                         is_dir,
                         path: rel_path_buf.clone(),
                         data_fork: None,
-            resource_fork: None,
+                        resource_fork: None,
                     };
 
                     self.nodes.insert(new_id, node);
@@ -629,27 +664,14 @@ impl Volume {
     pub fn get_modified_at(&self) -> u32 {
         std::fs::metadata(&self.path)
             .and_then(|m| m.modified())
-            .map(|t| if self.afp_v2 { time_to_afp(t) } else { time_to_afp_v1(t) })
+            .map(time_to_afp_v1)
             .unwrap_or(self.created_at)
     }
 
-    /// Returns the last backup time of the volume as a u32 in Macintosh time format.
-    /// 0x80000000 is the AFP sentinel for "never backed up".
     pub fn get_backup_at(&self) -> u32 {
-        0x80000000u32
+        0
     }
 
-    /// Update the AFP epoch used for date encoding based on the negotiated version.
-    /// Call this after FPLogin to reflect the client's chosen AFP version.
-    pub fn set_afp_v2(&mut self, afp_v2: bool) {
-        self.afp_v2 = afp_v2;
-        // Recompute created_at with the correct epoch now that we know the version.
-        self.created_at = if afp_v2 {
-            time_to_afp(SystemTime::now())
-        } else {
-            time_to_afp_v1(SystemTime::now())
-        };
-    }
     /// Returns the assigned volume ID. This ID is used for all AFP requests to identify this volume.
     pub fn get_volume_id(&self) -> u16 {
         self.volume_id
@@ -659,16 +681,11 @@ impl Volume {
     /// TODO: Set this to some sane value. 4GiB is the limit for AFP 2.1 and earlier, which we want
     /// to support.
     pub fn get_bytes_free(&self) -> u32 {
-        // Just hard code to 1GiB for now
-        1024 * 1024 * 1024
+        i32::MAX as u32
     }
 
-    /// Returns the total bytes on the volume as a 64-bit value.
-    /// TODO: Set this to some sane value. 4GiB is the limit for AFP 2.1 and earlier, which we want
-    /// to support.
     pub fn get_bytes_total(&self) -> u32 {
-        // Just hard code to 1GiB for now
-        1024 * 1024 * 1024
+        i32::MAX as u32
     }
 
     /// Returns an FPVolume struct with the current volume information.
@@ -743,8 +760,11 @@ impl Volume {
         }
 
         if bitmap.contains(FPVolumeBitmap::VOLUME_NAME) {
-            let pascal_offset = offset + 2;
-            output[offset..pascal_offset].copy_from_slice(&(pascal_offset as u16).to_be_bytes());
+            // Offset is relative to the start of the params block (after the 2-byte bitmap).
+            // The pascal string lands at offset+2 in the buffer; bitmap occupies [0..2],
+            // so params-relative = (offset + 2) - 2 = offset.
+            let params_relative_offset = offset as u16;
+            output[offset..offset + 2].copy_from_slice(&params_relative_offset.to_be_bytes());
             offset += 2;
 
             output[offset] = self.name.len() as u8;
@@ -763,15 +783,14 @@ impl Volume {
     pub async fn count_directory_entries(path: &PathBuf) -> std::io::Result<u16> {
         let mut entries = tokio::fs::read_dir(path).await?;
         let mut count: u16 = 0;
-
         while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name().to_string_lossy().to_string();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
             if name == ".tailtalk" {
                 continue;
             }
             count = count.saturating_add(1);
         }
-
         Ok(count)
     }
 
@@ -790,7 +809,6 @@ impl Volume {
             .ok_or(AfpError::ObjectNotFound)?;
         let node = self.nodes.get(&id).ok_or(AfpError::ObjectNotFound)?;
 
-        // Needed for OFFSPRING_COUNT if we rely on FS
         let full_path = self.path.join(relative_path);
 
         if bitmap.contains(FPDirectoryBitmap::ATTRIBUTES) {
@@ -865,19 +883,7 @@ impl Volume {
         }
 
         if bitmap.contains(FPDirectoryBitmap::ACCESS_RIGHTS) {
-            let summary = FPAccessRights::READ
-                | FPAccessRights::WRITE
-                | FPAccessRights::SEARCH
-                | FPAccessRights::OWNER;
-            let owner = FPAccessRights::READ | FPAccessRights::WRITE | FPAccessRights::SEARCH;
-            let group = FPAccessRights::READ | FPAccessRights::SEARCH;
-            let other = FPAccessRights::READ | FPAccessRights::SEARCH;
-
-            // Write the 4-byte access rights structure
-            output[offset] = summary.bits();
-            output[offset + 1] = owner.bits();
-            output[offset + 2] = group.bits();
-            output[offset + 3] = other.bits();
+            output[offset..offset + 4].copy_from_slice(&0x87070707u32.to_be_bytes());
             offset += 4;
         }
 
@@ -896,8 +902,7 @@ impl Volume {
             .ok_or(AfpError::ObjectNotFound)?;
         let node = self.nodes.get(&id).ok_or(AfpError::ObjectNotFound)?;
 
-        node.get_file_parms_resp(&self.path, bitmap, output, self.afp_v2)
-            .await
+        node.get_file_parms_resp(&self.path, bitmap, output).await
     }
 
     pub async fn get_fork_parms(
@@ -912,8 +917,7 @@ impl Volume {
             .ok_or(AfpError::ObjectNotFound)?;
         let node = self.nodes.get(node_id).ok_or(AfpError::ObjectNotFound)?;
 
-        node.get_file_parms_resp(&self.path, bitmap, output, self.afp_v2)
-            .await
+        node.get_file_parms_resp(&self.path, bitmap, output).await
     }
 
     pub async fn open_fork(
@@ -928,9 +932,7 @@ impl Volume {
 
         match fork_type {
             ForkType::Data => {
-                let parent_path = self
-                    .get_node_path(dir_id)
-                    .ok_or(AfpError::ObjectNotFound)?;
+                let parent_path = self.get_node_path(dir_id).ok_or(AfpError::ObjectNotFound)?;
 
                 let full_relative_path = parent_path.join(relative_path);
 
@@ -975,9 +977,7 @@ impl Volume {
                 }
             }
             ForkType::Resource => {
-                let parent_path = self
-                    .get_node_path(dir_id)
-                    .ok_or(AfpError::ObjectNotFound)?;
+                let parent_path = self.get_node_path(dir_id).ok_or(AfpError::ObjectNotFound)?;
                 let full_relative_path = parent_path.join(relative_path);
 
                 let id = *self
@@ -1026,6 +1026,12 @@ impl Volume {
     pub async fn open_dt(&mut self) -> Result<u16, AfpError> {
         if let Some(ref db) = self.desktop_database {
             return Ok(db.dt_ref_num);
+        }
+
+        // Create .AppleDesktop directory so offspring counts match ClassicStack behaviour.
+        let apple_desktop = self.path.join(".AppleDesktop");
+        if !apple_desktop.exists() {
+            let _ = tokio::fs::create_dir(&apple_desktop).await;
         }
 
         let db = crate::afp::DesktopDatabase::new(&self.path, 1)?;
@@ -1221,7 +1227,10 @@ impl Volume {
                     return Err(AfpError::BitmapErr);
                 }
                 if let Some(len) = cmd.resource_fork_length {
-                    let file = node.resource_fork.as_mut().ok_or(AfpError::ObjectNotFound)?;
+                    let file = node
+                        .resource_fork
+                        .as_mut()
+                        .ok_or(AfpError::ObjectNotFound)?;
                     file.set_len(len as u64).await.map_err(|e| {
                         error!("Failed to set resource fork length: {:?}", e);
                         AfpError::AccessDenied
@@ -1234,20 +1243,23 @@ impl Volume {
     }
 
     pub async fn enumerate(
-        &self,
+        &mut self,
         enumerate_cmd: FPEnumerate,
         output: &mut [u8],
     ) -> Result<usize, AfpError> {
         let node_id =
             self.resolve_node(enumerate_cmd.directory_id, Path::new(&enumerate_cmd.path))?;
 
-        let node = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?;
+        let (node_is_dir, node_path) = {
+            let node = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?;
+            (node.is_dir, node.path.clone())
+        };
 
-        if !node.is_dir {
+        if !node_is_dir {
             return Err(AfpError::ObjectTypeErr);
         }
 
-        let full_path = self.path.join(&node.path);
+        let full_path = self.path.join(&node_path);
         let mut entries = Vec::new();
 
         let mut read_dir = tokio::fs::read_dir(&full_path)
@@ -1281,14 +1293,20 @@ impl Volume {
 
         let start_index = enumerate_cmd.start_index as usize;
 
-        if start_index == 0 || start_index > entries.len() {
+        if start_index == 0 {
             return Err(AfpError::ObjectNotFound);
         }
 
         let start_idx = start_index - 1;
         let end_idx = std::cmp::min(start_idx + enumerate_cmd.req_count as usize, entries.len());
 
-        let entries_to_return = &entries[start_idx..end_idx];
+        // start_idx may be past the end of the directory; produce an empty page (count=0).
+        let entries_to_return: &[(tokio::fs::DirEntry, bool, String)] =
+            if start_idx < entries.len() {
+                &entries[start_idx..end_idx]
+            } else {
+                &[]
+            };
 
         let mut offset = 0;
         let count_offset = offset;
@@ -1296,14 +1314,30 @@ impl Volume {
         let mut actual_count: u16 = 0;
 
         for (_entry, is_dir, name) in entries_to_return {
-            let entry_relative_path = node.path.join(name);
+            let entry_relative_path = node_path.join(name);
+
+            if !self.path_to_id.contains_key(&entry_relative_path) {
+                let new_id = self.next_id;
+                self.next_id += 1;
+                let new_node = Node {
+                    id: new_id,
+                    parent_id: node_id,
+                    name: name.clone(),
+                    is_dir: *is_dir,
+                    path: entry_relative_path.clone(),
+                    data_fork: None,
+                    resource_fork: None,
+                };
+                self.nodes.insert(new_id, new_node);
+                self.path_to_id.insert(entry_relative_path.clone(), new_id);
+            }
             let mut entry_offset = offset;
 
             if *is_dir {
                 let mut pad_byte = false;
                 let mut directory_bitmap_len =
                     enumerate_cmd.directory_bitmap.response_len(name.len());
-                if directory_bitmap_len.is_multiple_of(2) {
+                if !directory_bitmap_len.is_multiple_of(2) {
                     directory_bitmap_len += 1;
                     pad_byte = true;
                 }
@@ -1343,7 +1377,7 @@ impl Volume {
             } else {
                 let mut pad_byte = false;
                 let mut file_bitmap_len = enumerate_cmd.file_bitmap.response_len(name.len());
-                if file_bitmap_len.is_multiple_of(2) {
+                if !file_bitmap_len.is_multiple_of(2) {
                     file_bitmap_len += 1;
                     pad_byte = true;
                 }
@@ -1505,11 +1539,17 @@ impl Volume {
 
         // Snapshot what we need from both nodes before taking mut references.
         let (src_old_name, src_old_relative, src_is_dir) = {
-            let n = self.nodes.get(&src_node_id).ok_or(AfpError::ObjectNotFound)?;
+            let n = self
+                .nodes
+                .get(&src_node_id)
+                .ok_or(AfpError::ObjectNotFound)?;
             (n.name.clone(), n.path.clone(), n.is_dir)
         };
         let dst_relative = {
-            let n = self.nodes.get(&dst_node_id).ok_or(AfpError::ObjectNotFound)?;
+            let n = self
+                .nodes
+                .get(&dst_node_id)
+                .ok_or(AfpError::ObjectNotFound)?;
             if !n.is_dir {
                 return Err(AfpError::ObjectTypeErr);
             }
@@ -1525,10 +1565,8 @@ impl Volume {
         let new_relative = dst_relative.join(&effective_name);
 
         // Conflict check — allow same-path (pure rename or no-op move).
-        if new_relative != src_old_relative {
-            if self.path_to_id.contains_key(&new_relative) {
-                return Err(AfpError::ObjectExists);
-            }
+        if new_relative != src_old_relative && self.path_to_id.contains_key(&new_relative) {
+            return Err(AfpError::ObjectExists);
         }
 
         let old_absolute = self.path.join(&src_old_relative);
@@ -1566,7 +1604,9 @@ impl Volume {
             let child_updates: Vec<(u32, PathBuf, PathBuf)> = self
                 .nodes
                 .iter()
-                .filter(|(id, node)| **id != src_node_id && node.path.starts_with(&src_old_relative))
+                .filter(|(id, node)| {
+                    **id != src_node_id && node.path.starts_with(&src_old_relative)
+                })
                 .map(|(id, node)| {
                     let suffix = node.path.strip_prefix(&src_old_relative).unwrap();
                     let new_child_path = new_relative.join(suffix);
@@ -1770,7 +1810,7 @@ mod tests {
         File::create(&file1_path).await.unwrap();
         File::create(&file2_path).await.unwrap();
 
-        let volume = Volume::new(volume_name, root_path.clone(), 1, true).await;
+        let volume = Volume::new(volume_name, root_path.clone(), 1).await;
 
         let enumerate_cmd = FPEnumerate {
             volume_id: 1,
@@ -1804,10 +1844,14 @@ mod tests {
         File::create(root_path.join("root_file.txt")).await.unwrap();
 
         // File in subdirectory
-        tokio::fs::create_dir(root_path.join("subdir")).await.unwrap();
-        File::create(root_path.join("subdir").join("sub_file.txt")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("subdir"))
+            .await
+            .unwrap();
+        File::create(root_path.join("subdir").join("sub_file.txt"))
+            .await
+            .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
 
         let mut output = [0u8; 256];
 
@@ -1821,7 +1865,11 @@ mod tests {
                 &mut output,
             )
             .await;
-        assert!(result.is_ok(), "open_fork at root failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "open_fork at root failed: {:?}",
+            result.err()
+        );
         let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
         assert!(fork_ref > 0);
 
@@ -1829,9 +1877,19 @@ mod tests {
 
         // Opening the same file a second time while already open should fail
         let double_open = volume
-            .open_fork(ForkType::Data, FPFileBitmap::FILE_NUMBER, 2, &PathBuf::from("root_file.txt"), &mut output)
+            .open_fork(
+                ForkType::Data,
+                FPFileBitmap::FILE_NUMBER,
+                2,
+                &PathBuf::from("root_file.txt"),
+                &mut output,
+            )
             .await;
-        assert_eq!(double_open, Err(AfpError::FileBusy), "double open should return FileBusy");
+        assert_eq!(
+            double_open,
+            Err(AfpError::FileBusy),
+            "double open should return FileBusy"
+        );
 
         volume.close_fork(fork_ref).await.unwrap();
 
@@ -1846,11 +1904,18 @@ mod tests {
                 &mut output,
             )
             .await;
-        assert!(result.is_ok(), "open_fork in subdir failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "open_fork in subdir failed: {:?}",
+            result.err()
+        );
         let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
         assert!(fork_ref > 0);
 
-        volume.write_fork(fork_ref, 0, b"hello subdir").await.unwrap();
+        volume
+            .write_fork(fork_ref, 0, b"hello subdir")
+            .await
+            .unwrap();
         volume.close_fork(fork_ref).await.unwrap();
     }
 
@@ -1861,17 +1926,31 @@ mod tests {
         File::create(root_path.join("rsrc_test.txt")).await.unwrap();
 
         // File in a subdirectory too
-        tokio::fs::create_dir(root_path.join("subdir")).await.unwrap();
-        File::create(root_path.join("subdir").join("rsrc_sub.txt")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("subdir"))
+            .await
+            .unwrap();
+        File::create(root_path.join("subdir").join("rsrc_sub.txt"))
+            .await
+            .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
         let mut output = [0u8; 256];
 
         // --- Root-level file ---
         let result = volume
-            .open_fork(ForkType::Resource, FPFileBitmap::RESOURCE_FORK_LENGTH, 2, &PathBuf::from("rsrc_test.txt"), &mut output)
+            .open_fork(
+                ForkType::Resource,
+                FPFileBitmap::RESOURCE_FORK_LENGTH,
+                2,
+                &PathBuf::from("rsrc_test.txt"),
+                &mut output,
+            )
             .await;
-        assert!(result.is_ok(), "open resource fork failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "open resource fork failed: {:?}",
+            result.err()
+        );
         let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
 
         let payload = b"resource fork data";
@@ -1880,7 +1959,11 @@ mod tests {
 
         // Sidecar file should exist at the expected path
         let sidecar = rsrc_path(&root_path, Path::new("rsrc_test.txt"));
-        assert!(sidecar.exists(), "sidecar file should exist at {:?}", sidecar);
+        assert!(
+            sidecar.exists(),
+            "sidecar file should exist at {:?}",
+            sidecar
+        );
         let sidecar_contents = tokio::fs::read(&sidecar).await.unwrap();
         assert_eq!(sidecar_contents, payload);
 
@@ -1888,7 +1971,12 @@ mod tests {
         let node_id = volume.resolve_node(2, Path::new("rsrc_test.txt")).unwrap();
         let mut parms_output = [0u8; 64];
         let (_, bytes_written) = volume
-            .get_node_parms(node_id, FPFileBitmap::RESOURCE_FORK_LENGTH, FPDirectoryBitmap::empty(), &mut parms_output)
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::RESOURCE_FORK_LENGTH,
+                FPDirectoryBitmap::empty(),
+                &mut parms_output,
+            )
             .await
             .unwrap();
         assert_eq!(bytes_written, 4);
@@ -1898,27 +1986,51 @@ mod tests {
         // --- File in subdirectory ---
         let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
         let result = volume
-            .open_fork(ForkType::Resource, FPFileBitmap::RESOURCE_FORK_LENGTH, subdir_id, &PathBuf::from("rsrc_sub.txt"), &mut output)
+            .open_fork(
+                ForkType::Resource,
+                FPFileBitmap::RESOURCE_FORK_LENGTH,
+                subdir_id,
+                &PathBuf::from("rsrc_sub.txt"),
+                &mut output,
+            )
             .await;
-        assert!(result.is_ok(), "open resource fork in subdir failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "open resource fork in subdir failed: {:?}",
+            result.err()
+        );
         let fork_ref = u16::from_be_bytes(output[2..4].try_into().unwrap());
 
-        volume.write_fork(fork_ref, 0, b"sub resource").await.unwrap();
+        volume
+            .write_fork(fork_ref, 0, b"sub resource")
+            .await
+            .unwrap();
         volume.close_fork(fork_ref).await.unwrap();
 
         let sub_sidecar = rsrc_path(&root_path, Path::new("subdir/rsrc_sub.txt"));
-        assert!(sub_sidecar.exists(), "subdir sidecar should exist at {:?}", sub_sidecar);
+        assert!(
+            sub_sidecar.exists(),
+            "subdir sidecar should exist at {:?}",
+            sub_sidecar
+        );
 
         // Deleting the file should remove the sidecar
-        let delete_req = FPDelete { volume_id: 1, directory_id: 2, path: "rsrc_test.txt".into() };
+        let delete_req = FPDelete {
+            volume_id: 1,
+            directory_id: 2,
+            path: "rsrc_test.txt".into(),
+        };
         volume.delete(&delete_req).await.unwrap();
-        assert!(!sidecar.exists(), "sidecar should be removed when file is deleted");
+        assert!(
+            !sidecar.exists(),
+            "sidecar should be removed when file is deleted"
+        );
     }
 
     #[tokio::test]
     async fn test_resolve_node_identity() {
         let dir = tempdir().unwrap();
-        let volume = Volume::new("TestVol".to_string(), dir.path().to_path_buf(), 1, true).await;
+        let volume = Volume::new("TestVol".to_string(), dir.path().to_path_buf(), 1).await;
 
         // ID 1 + empty path = ID 1 (virtual parent-of-root)
         assert_eq!(volume.resolve_node(1, Path::new("")).unwrap(), 1);
@@ -1937,19 +2049,27 @@ mod tests {
     async fn test_resolve_subdir() {
         let dir = tempdir().unwrap();
         let root_path = dir.path().to_path_buf();
-        tokio::fs::create_dir(root_path.join("subdir")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("subdir"))
+            .await
+            .unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
 
         // Resolve subdir from root
         let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
         assert!(subdir_id >= 3, "subdir should have a real node ID");
 
         // Identity lookup on the subdir itself
-        assert_eq!(volume.resolve_node(subdir_id, Path::new("")).unwrap(), subdir_id);
+        assert_eq!(
+            volume.resolve_node(subdir_id, Path::new("")).unwrap(),
+            subdir_id
+        );
 
         // Null-byte path also resolves as identity
-        assert_eq!(volume.resolve_node(subdir_id, Path::new("\0")).unwrap(), subdir_id);
+        assert_eq!(
+            volume.resolve_node(subdir_id, Path::new("\0")).unwrap(),
+            subdir_id
+        );
     }
 
     #[tokio::test]
@@ -1962,7 +2082,7 @@ mod tests {
         File::create(subdir.join("b.txt")).await.unwrap();
         File::create(subdir.join("c.txt")).await.unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
         let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
 
         let enumerate_cmd = FPEnumerate {
@@ -1995,16 +2115,22 @@ mod tests {
             path: "".into(),
         };
         let result = volume.enumerate(zero_index_cmd, &mut output).await;
-        assert_eq!(result, Err(AfpError::ObjectNotFound), "start_index=0 should return ObjectNotFound");
+        assert_eq!(
+            result,
+            Err(AfpError::ObjectNotFound),
+            "start_index=0 should return ObjectNotFound"
+        );
     }
 
     #[tokio::test]
     async fn test_finder_info_roundtrip() {
         let dir = tempdir().unwrap();
         let root_path = dir.path().to_path_buf();
-        tokio::fs::create_dir(root_path.join("mydir")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("mydir"))
+            .await
+            .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
         let node_id = volume.resolve_node(2, Path::new("mydir")).unwrap();
 
         // Build a recognisable 32-byte Finder Info payload
@@ -2013,18 +2139,33 @@ mod tests {
         finder_info[28..32].copy_from_slice(b"TAIL");
 
         volume
-            .set_node_parms(node_id, FPFileBitmap::empty(), FPDirectoryBitmap::FINDER_INFO, &finder_info)
+            .set_node_parms(
+                node_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::FINDER_INFO,
+                &finder_info,
+            )
+            .await
             .unwrap();
 
         let mut output = [0u8; 256];
         let (is_dir, bytes_written) = volume
-            .get_node_parms(node_id, FPFileBitmap::empty(), FPDirectoryBitmap::FINDER_INFO, &mut output)
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::empty(),
+                FPDirectoryBitmap::FINDER_INFO,
+                &mut output,
+            )
             .await
             .unwrap();
 
         assert!(is_dir);
         assert_eq!(bytes_written, 32);
-        assert_eq!(&output[0..32], &finder_info, "finder info roundtrip mismatch");
+        assert_eq!(
+            &output[0..32],
+            &finder_info,
+            "finder info roundtrip mismatch"
+        );
     }
 
     #[tokio::test]
@@ -2033,7 +2174,7 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("todelete.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2043,7 +2184,10 @@ mod tests {
 
         volume.delete(&delete_req).await.unwrap();
 
-        assert!(!root_path.join("todelete.txt").exists(), "file should be gone from disk");
+        assert!(
+            !root_path.join("todelete.txt").exists(),
+            "file should be gone from disk"
+        );
 
         let result = volume.resolve_node(2, Path::new("todelete.txt"));
         assert!(result.is_err(), "node should be removed from volume index");
@@ -2057,7 +2201,7 @@ mod tests {
         tokio::fs::create_dir(&subdir).await.unwrap();
         File::create(subdir.join("occupant.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2075,19 +2219,24 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("test.txt")).await.unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
         let node_id = volume.resolve_node(2, Path::new("test.txt")).unwrap();
 
         let mut output = [0u8; 64];
         let (is_dir, bytes_written) = volume
-            .get_node_parms(node_id, FPFileBitmap::BACKUP_DATE, FPDirectoryBitmap::empty(), &mut output)
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::BACKUP_DATE,
+                FPDirectoryBitmap::empty(),
+                &mut output,
+            )
             .await
             .unwrap();
 
         assert!(!is_dir);
         assert_eq!(bytes_written, 4);
         let backup_date = u32::from_be_bytes(output[0..4].try_into().unwrap());
-        assert_eq!(backup_date, 0x80000000u32, "backup date should be the AFP never-backed-up sentinel");
+        assert_eq!(backup_date, 0, "backup date should be zero (never backed up)");
     }
 
     #[tokio::test]
@@ -2096,7 +2245,7 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("test.txt")).await.unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path, 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
         let node_id = volume.resolve_node(2, Path::new("test.txt")).unwrap();
 
         let mut finder_info = [0u8; 32];
@@ -2105,27 +2254,44 @@ mod tests {
 
         // FPDirectoryBitmap::FINDER_INFO is reused here — files use the same bit position
         volume
-            .set_node_parms(node_id, FPFileBitmap::FINDER_INFO, FPDirectoryBitmap::empty(), &finder_info)
+            .set_node_parms(
+                node_id,
+                FPFileBitmap::FINDER_INFO,
+                FPDirectoryBitmap::empty(),
+                &finder_info,
+            )
+            .await
             .unwrap();
 
         let mut output = [0u8; 256];
         let (is_dir, bytes_written) = volume
-            .get_node_parms(node_id, FPFileBitmap::FINDER_INFO, FPDirectoryBitmap::empty(), &mut output)
+            .get_node_parms(
+                node_id,
+                FPFileBitmap::FINDER_INFO,
+                FPDirectoryBitmap::empty(),
+                &mut output,
+            )
             .await
             .unwrap();
 
         assert!(!is_dir);
         assert_eq!(bytes_written, 32);
-        assert_eq!(&output[0..32], &finder_info, "finder info roundtrip failed for file");
+        assert_eq!(
+            &output[0..32],
+            &finder_info,
+            "finder info roundtrip failed for file"
+        );
     }
 
     #[tokio::test]
     async fn test_delete_empty_dir() {
         let dir = tempdir().unwrap();
         let root_path = dir.path().to_path_buf();
-        tokio::fs::create_dir(root_path.join("emptydir")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("emptydir"))
+            .await
+            .unwrap();
 
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
 
         let delete_req = FPDelete {
             volume_id: 1,
@@ -2135,7 +2301,10 @@ mod tests {
 
         volume.delete(&delete_req).await.unwrap();
 
-        assert!(!root_path.join("emptydir").exists(), "dir should be gone from disk");
+        assert!(
+            !root_path.join("emptydir").exists(),
+            "dir should be gone from disk"
+        );
 
         let result = volume.resolve_node(2, Path::new("emptydir"));
         assert!(result.is_err(), "node should be removed from volume index");
@@ -2150,7 +2319,7 @@ mod tests {
     async fn test_trash_folder_lifecycle() {
         let dir = tempdir().unwrap();
         let root_path = dir.path().to_path_buf();
-        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1, true).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
 
         // Step 1: Finder creates "Network Trash Folder" at volume root (DID=2).
         let network_trash_id = volume
@@ -2164,7 +2333,10 @@ mod tests {
             .create_dir(network_trash_id, PathBuf::from("Trash Can #2"))
             .await
             .unwrap();
-        assert!(trash_can_id > network_trash_id, "child DID must be greater than parent DID");
+        assert!(
+            trash_can_id > network_trash_id,
+            "child DID must be greater than parent DID"
+        );
 
         // Step 3: FPGetFileDirParms on "Network Trash Folder" — verify PARENT_DIR_ID and DIR_ID.
         let mut output = [0u8; 256];
@@ -2177,12 +2349,21 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(is_dir, "Network Trash Folder must be reported as a directory");
+        assert!(
+            is_dir,
+            "Network Trash Folder must be reported as a directory"
+        );
         assert_eq!(bytes_written, 8);
         let parent_dir_id = u32::from_be_bytes(output[0..4].try_into().unwrap());
         let dir_id = u32::from_be_bytes(output[4..8].try_into().unwrap());
-        assert_eq!(parent_dir_id, 2, "Network Trash Folder's parent should be volume root (DID=2)");
-        assert_eq!(dir_id, network_trash_id, "DIR_ID must match the ID returned by create_dir");
+        assert_eq!(
+            parent_dir_id, 2,
+            "Network Trash Folder's parent should be volume root (DID=2)"
+        );
+        assert_eq!(
+            dir_id, network_trash_id,
+            "DIR_ID must match the ID returned by create_dir"
+        );
 
         // Step 4: FPGetFileDirParms on "Trash Can #2" — verify PARENT_DIR_ID and DIR_ID.
         output.fill(0);
@@ -2203,14 +2384,19 @@ mod tests {
             parent_dir_id, network_trash_id,
             "Trash Can's parent should be Network Trash Folder"
         );
-        assert_eq!(dir_id, trash_can_id, "DIR_ID must match the ID returned by create_dir");
+        assert_eq!(
+            dir_id, trash_can_id,
+            "DIR_ID must match the ID returned by create_dir"
+        );
 
         // Step 5: FPEnumerate "Network Trash Folder" — should yield exactly "Trash Can #2".
         let enumerate_cmd = FPEnumerate {
             volume_id: 1,
             directory_id: network_trash_id,
             file_bitmap: FPFileBitmap::LONG_NAME,
-            directory_bitmap: FPDirectoryBitmap::LONG_NAME | FPDirectoryBitmap::DIR_ID | FPDirectoryBitmap::PARENT_DIR_ID,
+            directory_bitmap: FPDirectoryBitmap::LONG_NAME
+                | FPDirectoryBitmap::DIR_ID
+                | FPDirectoryBitmap::PARENT_DIR_ID,
             req_count: 100,
             start_index: 1,
             max_reply_size: 2048,
@@ -2218,9 +2404,16 @@ mod tests {
         };
         let mut enum_buf = [0u8; 2048];
         let result = volume.enumerate(enumerate_cmd, &mut enum_buf).await;
-        assert!(result.is_ok(), "enumerate should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "enumerate should succeed: {:?}",
+            result.err()
+        );
         let count = u16::from_be_bytes(enum_buf[0..2].try_into().unwrap());
-        assert_eq!(count, 1, "Network Trash Folder should contain exactly Trash Can #2");
+        assert_eq!(
+            count, 1,
+            "Network Trash Folder should contain exactly Trash Can #2"
+        );
 
         // Step 6: FPDelete "Trash Can #2" by parent DID + name (how the Finder issues it).
         let delete_req = FPDelete {
@@ -2230,7 +2423,10 @@ mod tests {
         };
         volume.delete(&delete_req).await.unwrap();
         assert!(
-            !root_path.join("Network Trash Folder").join("Trash Can #2").exists(),
+            !root_path
+                .join("Network Trash Folder")
+                .join("Trash Can #2")
+                .exists(),
             "Trash Can #2 must be gone from disk"
         );
 

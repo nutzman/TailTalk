@@ -185,7 +185,7 @@ impl DdpProcessor {
         };
 
         if self.addressing.try_lookup(&source_addr).is_none() {
-            tracing::info!(
+            tracing::debug!(
                 "Learning new address from DDP packet: {}.{} -> {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ({})",
                 source_addr.network_number,
                 source_addr.node_number,
@@ -278,6 +278,7 @@ impl DdpProcessor {
         let mut payload = vec![0u8; payload_len].into_boxed_slice();
 
         let header_size = if use_short {
+            // Short DDP (LocalTalk) does not use checksums — leave chksum=0.
             headers
                 .to_bytes_short(&mut payload)
                 .expect("failed to encode short headers")
@@ -285,6 +286,7 @@ impl DdpProcessor {
             let size = headers
                 .to_bytes(&mut payload)
                 .expect("failed to encode headers");
+            // Zero the checksum field before computing the checksum.
             payload[2] = 0;
             payload[3] = 0;
             size
@@ -292,7 +294,16 @@ impl DdpProcessor {
 
         payload[header_size..].copy_from_slice(&packet.payload);
 
-        tracing::info!("DDP: Sending packet with headers {:?}", headers);
+        // Compute and insert DDP checksum for long DDP (EtherTalk).
+        // Per the spec, the checksum covers bytes 4..end (everything after the
+        // 4-byte hop/len+chksum fields). A result of 0 is replaced with 0xFFFF.
+        if !use_short {
+            let chksum = DdpHeaders::compute_checksum(&payload[4..]);
+            payload[2] = (chksum >> 8) as u8;
+            payload[3] = (chksum & 0xFF) as u8;
+        }
+
+        tracing::debug!("DDP: Sending packet with headers {:?}", headers);
 
         self.ethertalk
             .send(DataLinkPacket {

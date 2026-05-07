@@ -5,14 +5,14 @@ use crate::nbp::NbpHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tailtalk_packets::afp::{
-    AfpError, AfpUam, AfpVersion, FPByteRangeLock, FPCloseFork, FPCreateDir, FPCreateFile,
-    FPDelete, FPDirectoryBitmap, FPEnumerate, FPFlush, FPGetFileDirParms, FPGetForkParms,
-    FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead,
-    FPRename, FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
-    AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME,
+    AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME, AfpError, AfpUam, AfpVersion,
+    FPByteRangeLock, FPCloseFork, FPCreateDir, FPCreateFile, FPDelete, FPDirectoryBitmap,
+    FPEnumerate, FPFileBitmap, FPFlush, FPGetFileDirParms, FPGetForkParms, FPGetSrvrInfo,
+    FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead, FPRename, FPSetDirParms,
+    FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
 };
 use tailtalk_packets::nbp::EntityName;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// AFP Server configuration
 pub struct AfpServerConfig {
@@ -23,12 +23,14 @@ pub struct AfpServerConfig {
     pub volume_icon: Option<[u8; 256]>,
     pub flags: u16,
     pub volume_path: PathBuf,
+    /// The volume name shown to AFP clients.
+    pub volume_name: String,
 }
 
 impl Default for AfpServerConfig {
     fn default() -> Self {
         // Default volume icon (same as example)
-        let volume_icon = [
+        let _volume_icon = [
             0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x2, 0x9f, 0xe0, 0x0,
             0x4, 0x50, 0x30, 0x0, 0x8, 0x30, 0x28, 0x0, 0x10, 0x10, 0x3c, 0x7, 0xa0, 0x8, 0x4,
             0x18, 0x7f, 0x4, 0x4, 0x10, 0x0, 0x82, 0x4, 0x10, 0x0, 0x81, 0x4, 0x10, 0x0, 0x82, 0x4,
@@ -49,17 +51,14 @@ impl Default for AfpServerConfig {
         ];
 
         Self {
-            server_name: "TailTalk AFP".to_string(),
-            machine_type: "Unix".to_string(),
-            afp_versions: vec![
-                AfpVersion::Version1,
-                AfpVersion::Version1_1,
-                AfpVersion::Version2,
-            ],
+            server_name: "TailTalk".to_string(),
+            machine_type: "Macintosh".to_string(),
+            afp_versions: vec![AfpVersion::Version2, AfpVersion::Version2_1],
             uams: vec![AfpUam::NoUserAuthent],
-            volume_icon: Some(volume_icon),
-            flags: 0x800b,
+            volume_icon: None,
+            flags: 0x3,
             volume_path: PathBuf::from("./"),
+            volume_name: "MacShare".to_string(),
         }
     }
 }
@@ -158,11 +157,12 @@ impl AspSession {
     async fn handle_session(mut self, config: Arc<AfpServerConfig>) -> anyhow::Result<()> {
         info!("Session {} handler started", self.id);
 
+        let volume_name = config.volume_name.clone();
+
         let mut our_volume = Volume::new(
-            "TailDrive".to_string(),
+            volume_name,
             config.volume_path.clone(),
-            1,    // TODO: How should these IDs be created?
-            true, // Default to AFP 2.x epoch; updated after FPLogin
+            1234, // TODO: How should these IDs be created?
         )
         .await;
 
@@ -184,7 +184,12 @@ impl AspSession {
 
             // Parse AFP command code (first byte)
             let cmd_code = command.data[0];
-            info!("Session {} received command code: {}", self.id, cmd_code);
+            debug!(
+                "Session {} AFP {} ({})",
+                self.id,
+                afp_cmd_name(cmd_code),
+                cmd_code
+            );
 
             // Handle commands
             match cmd_code {
@@ -194,19 +199,22 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_LOGIN => {
                     let data = command.data[1..].to_vec();
-                    if let Some(version) = self.handle_login(&data, command)? {
-                        // Update the volume's epoch to match the negotiated AFP version.
-                        // AFP 2.x uses Jan 1 2000; AFP 1.x uses Jan 1 1904.
-                        let afp_v2 =
-                            matches!(version, AfpVersion::Version2 | AfpVersion::Version2_1);
-                        our_volume.set_afp_v2(afp_v2);
-                    }
+                    self.handle_login(&data, command)?;
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_SRVR_PARMS => {
+                    debug!("AFP FPGetSrvrParms req: (no params)");
                     let vol_response = FPGetSrvrParms {
-                        server_time: crate::time_to_afp(std::time::SystemTime::now()),
+                        server_time: crate::time_to_afp_v1(std::time::SystemTime::now()),
                         volumes: vec![our_volume.get_fp_volume()],
                     };
+                    debug!(
+                        "AFP FPGetSrvrParms resp: OK volumes=[{:?}]",
+                        vol_response
+                            .volumes
+                            .iter()
+                            .map(|v| v.name.to_string())
+                            .collect::<Vec<_>>()
+                    );
                     let mut output_buf = [0u8; 128];
                     let offset = vol_response.to_bytes(&mut output_buf).map_err(|e| {
                         anyhow::anyhow!("Failed to serialize AFP GetSrvrParms: {:?}", e)
@@ -217,7 +225,14 @@ impl AspSession {
                     })?;
                 }
                 tailtalk_packets::afp::AFP_CMD_CLOSE_VOL => {
+                    let vol_id = if command.data.len() >= 4 {
+                        u16::from_be_bytes([command.data[2], command.data[3]])
+                    } else {
+                        0
+                    };
+                    debug!("AFP FPCloseVol req: vol_id={}", vol_id);
                     // TODO: Implement proper volume opening / closing checks
+                    debug!("AFP FPCloseVol resp: OK");
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
                         data: vec![],
@@ -227,12 +242,18 @@ impl AspSession {
                     let bitmap_req = FPVolumeBitmap::from(u16::from_be_bytes(
                         command.data[2..=3].try_into().unwrap(),
                     ));
+                    debug!("AFP FPOpenVol req: bitmap={:?}", bitmap_req);
                     let mut output_buf = [0u8; 128];
                     let offset = our_volume
                         .get_bitmap_resp(bitmap_req, &mut output_buf)
                         .map_err(|e| {
                             anyhow::anyhow!("insufficient buffer size for AFP OpenVol: {:?}", e)
                         })?;
+                    debug!(
+                        "AFP FPOpenVol resp: OK vol_id={} {} bytes",
+                        our_volume.get_volume_id(),
+                        offset
+                    );
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
                         data: output_buf[..offset].to_vec(),
@@ -240,12 +261,17 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_VOL_PARMS => {
                     let vol_parms_req = FPGetVolParms::parse(&command.data[2..]).unwrap();
+                    debug!(
+                        "AFP FPGetVolParms req: vol_id={}, bitmap={:?}",
+                        vol_parms_req.volume_id, vol_parms_req.bitmap
+                    );
                     let mut output_buf = [0u8; 128];
                     let offset = our_volume
                         .get_bitmap_resp(vol_parms_req.bitmap, &mut output_buf)
                         .map_err(|e| {
                             anyhow::anyhow!("insufficient buffer size for AFP GetVolParms: {:?}", e)
                         })?;
+                    debug!("AFP FPGetVolParms resp: OK {} bytes", offset);
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
                         data: output_buf[..offset].to_vec(),
@@ -277,15 +303,11 @@ impl AspSession {
                     self.handle_enumerate(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_SRVR_MSG => {
-                    // FPGetSrvrMsg - Return an empty server message
-                    // Response format:
-                    // Bytes 0-1: MessageType (0 = no message)
-                    // Bytes 2-3: MessageBitmap (0 = no flags set)
-                    // Bytes 4+: Message string (empty Pascal string = just length byte 0)
-                    let response = vec![0, 0, 0, 1, 6, b'H', b'e', b'l', b'l', b'o', b'!'];
+                    debug!("AFP FPGetSrvrMsg req: (stub)");
+                    debug!("AFP FPGetSrvrMsg resp: OK empty message");
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
-                        data: response,
+                        data: vec![0, 0, 0, 0],
                     })?;
                 }
                 tailtalk_packets::afp::AFP_CMD_OPEN_FORK => {
@@ -303,20 +325,25 @@ impl AspSession {
                 tailtalk_packets::afp::AFP_CMD_FLUSH => {
                     self.handle_flush(command, &mut our_volume).await?;
                 }
-                tailtalk_packets::afp::AFP_CMD_OPEN_DT => match our_volume.open_dt().await {
-                    Ok(ref_num) => {
-                        command.send_reply(AspCommandResponse {
-                            result: [0u8; 4],
-                            data: ref_num.to_be_bytes().to_vec(),
-                        })?;
+                tailtalk_packets::afp::AFP_CMD_OPEN_DT => {
+                    debug!("AFP FPOpenDT req: (no params)");
+                    match our_volume.open_dt().await {
+                        Ok(ref_num) => {
+                            debug!("AFP FPOpenDT resp: OK dt_ref_num={}", ref_num);
+                            command.send_reply(AspCommandResponse {
+                                result: [0u8; 4],
+                                data: ref_num.to_be_bytes().to_vec(),
+                            })?;
+                        }
+                        Err(e) => {
+                            debug!("AFP FPOpenDT resp: err={:?}", e);
+                            command.send_reply(AspCommandResponse {
+                                result: (e as u32).to_be_bytes(),
+                                data: Vec::new(),
+                            })?;
+                        }
                     }
-                    Err(e) => {
-                        command.send_reply(AspCommandResponse {
-                            result: (e as u32).to_be_bytes(),
-                            data: Vec::new(),
-                        })?;
-                    }
-                },
+                }
                 tailtalk_packets::afp::AFP_CMD_GET_ICON => {
                     self.handle_get_icon(command, &mut our_volume).await?;
                 }
@@ -339,12 +366,15 @@ impl AspSession {
                     self.handle_add_comment(command, &mut our_volume).await?;
                 }
                 AFP_CMD_MOVE_AND_RENAME => {
-                    self.handle_move_and_rename(command, &mut our_volume).await?;
+                    self.handle_move_and_rename(command, &mut our_volume)
+                        .await?;
                 }
                 AFP_CMD_RENAME => {
                     self.handle_rename(command, &mut our_volume).await?;
                 }
                 AFP_CMD_LOGOUT => {
+                    debug!("AFP FPLogout req: (no params)");
+                    debug!("AFP FPLogout resp: OK session ending");
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
                         data: vec![],
@@ -352,14 +382,24 @@ impl AspSession {
                     break;
                 }
                 tailtalk_packets::afp::AFP_CMD_CLOSE_DT => {
+                    let dt_ref = if command.data.len() >= 4 {
+                        u16::from_be_bytes([command.data[2], command.data[3]])
+                    } else {
+                        0
+                    };
+                    debug!("AFP FPCloseDT req: dt_ref_num={}", dt_ref);
+                    debug!("AFP FPCloseDT resp: OK");
                     command.send_reply(AspCommandResponse {
                         result: [0u8; 4],
                         data: vec![],
                     })?;
                 }
                 _ => {
-                    warn!("Session {} unsupported command: {}", self.id, cmd_code);
-                    // Return error: command not supported
+                    warn!(
+                        "AFP unknown command {} ({}): returning FP error",
+                        afp_cmd_name(cmd_code),
+                        cmd_code
+                    );
                     command.send_reply(create_error_reply(AfpError::BadVersNum))?;
                 }
             }
@@ -374,17 +414,21 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let lock_req = FPByteRangeLock::parse(&command.data[1..]).unwrap();
-
-        tracing::info!("Session {} byte range lock: {:?}", self.id, lock_req);
+        debug!(
+            "AFP FPByteRangeLock req: fork_id={}, flags={:?}, offset={}, length={}",
+            lock_req.fork_id, lock_req.flags, lock_req.offset, lock_req.length
+        );
 
         match our_volume.byte_range_lock(&lock_req).await {
             Ok(first_byte) => {
+                debug!("AFP FPByteRangeLock resp: OK first_byte={}", first_byte);
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: first_byte.to_be_bytes().to_vec(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPByteRangeLock resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -401,16 +445,28 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let cmd = FPCreateDir::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPCreateDir req: dir_id={}, path={:?}",
+            cmd.directory_id,
+            cmd.path.to_string()
+        );
 
-        let dir_id = our_volume
+        match our_volume
             .create_dir(cmd.directory_id, PathBuf::from(cmd.path.to_string()))
             .await
-            .map_err(|e| anyhow::anyhow!("CreateDir failed: {:?}", e))?;
-
-        command.send_reply(AspCommandResponse {
-            result: [0u8; 4],
-            data: dir_id.to_be_bytes().to_vec(),
-        })?;
+        {
+            Ok(dir_id) => {
+                debug!("AFP FPCreateDir resp: OK new_dir_id={}", dir_id);
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: dir_id.to_be_bytes().to_vec(),
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPCreateDir resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+            }
+        }
 
         Ok(())
     }
@@ -421,6 +477,12 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let cmd = FPCreateFile::parse(&command.data[1..]).unwrap();
+        debug!(
+            "AFP FPCreateFile req: flag={:?}, dir_id={}, path={:?}",
+            cmd.create_flag,
+            cmd.directory_id,
+            cmd.path.to_string()
+        );
 
         match our_volume
             .create_file(
@@ -431,12 +493,14 @@ impl AspSession {
             .await
         {
             Ok(_) => {
+                debug!("AFP FPCreateFile resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPCreateFile resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -453,14 +517,21 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let delete_req = FPDelete::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPDelete req: dir_id={}, path={:?}",
+            delete_req.directory_id, delete_req.path
+        );
+
         match our_volume.delete(&delete_req).await {
             Ok(_) => {
+                debug!("AFP FPDelete resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPDelete resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -480,11 +551,24 @@ impl AspSession {
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = cmd.dir_bitmap;
         let path_name_buf = PathBuf::from(cmd.path.to_string());
+        debug!(
+            "AFP FPGetFileDirParms req: dir_id={}, path={:?}, file_bitmap={:?}, dir_bitmap={:?}",
+            cmd.directory_id, path_name_buf, file_bitmap, dir_bitmap
+        );
+
+        if cmd.directory_id == 1 {
+            debug!("AFP FPGetFileDirParms resp: err=ObjectNotFound (dir_id=1)");
+            command.send_reply(create_error_reply(AfpError::ObjectNotFound))?;
+            return Ok(());
+        }
 
         let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
-                tracing::error!("look up for {:?} failed: {:?}", path_name_buf, e);
+                debug!(
+                    "AFP FPGetFileDirParms resp: err={:?} (resolve failed for dir_id={}, path={:?})",
+                    e, cmd.directory_id, path_name_buf
+                );
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -500,6 +584,10 @@ impl AspSession {
         {
             Ok((is_dir, bytes_written)) => (is_dir, bytes_written),
             Err(e) => {
+                debug!(
+                    "AFP FPGetFileDirParms resp: err={:?} (get_node_parms node_id={})",
+                    e, node_id
+                );
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -514,6 +602,10 @@ impl AspSession {
         output_buf[4] = if is_dir { 1 << 7 } else { 0 };
         output_buf[5] = 0; // Padding
 
+        debug!(
+            "AFP FPGetFileDirParms resp: OK node_id={}, is_dir={}, {} param bytes",
+            node_id, is_dir, bytes_written
+        );
         command.send_reply(AspCommandResponse {
             result: [0u8; 4],
             data: output_buf[..6 + bytes_written].to_vec(),
@@ -531,10 +623,21 @@ impl AspSession {
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = FPDirectoryBitmap::from(cmd.file_bitmap.bits());
         let path_name_buf = PathBuf::from(cmd.path.to_string());
+        debug!(
+            "AFP FPSetFileDirParms req: dir_id={}, path={:?}, bitmap={:?}",
+            cmd.directory_id, path_name_buf, file_bitmap
+        );
+
+        if cmd.directory_id == 1 {
+            debug!("AFP FPSetFileDirParms resp: err=ObjectNotFound (dir_id=1)");
+            command.send_reply(create_error_reply(AfpError::ObjectNotFound))?;
+            return Ok(());
+        }
 
         let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
             Ok(node_id) => node_id,
             Err(e) => {
+                debug!("AFP FPSetFileDirParms resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -543,14 +646,19 @@ impl AspSession {
             }
         };
 
-        match our_volume.set_node_parms(node_id, file_bitmap, dir_bitmap, &cmd.params) {
+        match our_volume
+            .set_node_parms(node_id, file_bitmap, dir_bitmap, &cmd.params)
+            .await
+        {
             Ok(_) => {
+                debug!("AFP FPSetFileDirParms resp: OK node_id={}", node_id);
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: Vec::new(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPSetFileDirParms resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -569,6 +677,7 @@ impl AspSession {
         let cmd = match FPMoveAndRename::parse(&command.data[2..]) {
             Ok(c) => c,
             Err(e) => {
+                debug!("AFP FPMoveAndRename resp: parse err={:?}", e);
                 command.send_reply(create_error_reply(e))?;
                 return Ok(());
             }
@@ -576,6 +685,10 @@ impl AspSession {
 
         let src_path = PathBuf::from(cmd.src_path.to_string());
         let dst_path = PathBuf::from(cmd.dst_path.to_string());
+        debug!(
+            "AFP FPMoveAndRename req: src_dir={}, dst_dir={}, src={:?}, dst={:?}, new_name={:?}",
+            cmd.src_directory_id, cmd.dst_directory_id, src_path, dst_path, cmd.new_name
+        );
 
         match our_volume
             .move_and_rename(
@@ -588,12 +701,14 @@ impl AspSession {
             .await
         {
             Ok(()) => {
+                debug!("AFP FPMoveAndRename resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPMoveAndRename resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -612,10 +727,18 @@ impl AspSession {
         let cmd = match FPRename::parse(&command.data[2..]) {
             Ok(c) => c,
             Err(e) => {
+                debug!("AFP FPRename resp: parse err={:?}", e);
                 command.send_reply(create_error_reply(e))?;
                 return Ok(());
             }
         };
+
+        debug!(
+            "AFP FPRename req: dir_id={}, path={:?}, new_name={:?}",
+            cmd.directory_id,
+            cmd.path.to_string(),
+            cmd.new_name
+        );
 
         match our_volume
             .rename(
@@ -626,12 +749,14 @@ impl AspSession {
             .await
         {
             Ok(()) => {
+                debug!("AFP FPRename resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPRename resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -645,20 +770,59 @@ impl AspSession {
     async fn handle_set_dir_parms(
         &self,
         command: crate::asp::AspCommand,
-        _our_volume: &mut Volume,
+        our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let dir_cmd = FPSetDirParms::parse(&command.data[2..]).unwrap();
+        let path_name_buf = PathBuf::from(dir_cmd.path.to_string());
+        debug!(
+            "AFP FPSetDirParms req: dir_id={}, path={:?}, bitmap={:?}",
+            dir_cmd.directory_id, path_name_buf, dir_cmd.dir_bitmap
+        );
 
-        tracing::warn!("STUB: FPSetDirParms: {:?}", dir_cmd);
+        let node_id = match our_volume.resolve_node(dir_cmd.directory_id, &path_name_buf) {
+            Ok(node_id) => node_id,
+            Err(e) => {
+                debug!("AFP FPSetDirParms resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+                return Ok(());
+            }
+        };
 
-        /*our_volume
-        .set_dir_parms(dir_cmd.directory_id, dir_cmd.dir_bitmap)
-        .await?;*/
+        // Extract raw params from the command data.
+        // FPSetDirParms header is 2(vol_id) + 4(dir_id) + 2(bitmap) + 1(path_type) = 9 bytes + path.
+        // But we must account for word alignment of the params field.
+        let mut param_offset = 9 + dir_cmd.path.byte_len();
+        if !param_offset.is_multiple_of(2) {
+            param_offset += 1;
+        }
 
-        command.send_reply(AspCommandResponse {
-            result: [0u8; 4],
-            data: Vec::new(),
-        })?;
+        match our_volume
+            .set_node_parms(
+                node_id,
+                FPFileBitmap::empty(),
+                dir_cmd.dir_bitmap,
+                &command.data[2 + param_offset..],
+            )
+            .await
+        {
+            Ok(_) => {
+                debug!("AFP FPSetDirParms resp: OK node_id={}", node_id);
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: Vec::new(),
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPSetDirParms resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
 
         Ok(())
     }
@@ -668,10 +832,12 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let _flush_cmd = FPFlush::parse(&command.data[2..]).unwrap();
+        let flush_cmd = FPFlush::parse(&command.data[2..]).unwrap();
+        debug!("AFP FPFlush req: vol_id={}", flush_cmd.volume_id);
 
         let _ = our_volume.sync().await;
 
+        debug!("AFP FPFlush resp: OK");
         command.send_reply(AspCommandResponse {
             result: [0u8; 4],
             data: Vec::new(),
@@ -686,26 +852,31 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let read_cmd = FPRead::parse(&command.data[2..]).unwrap();
-
-        tracing::info!("Handling read command: {read_cmd:?}");
+        debug!(
+            "AFP FPRead req: fork_id={}, offset={}, req_count={}",
+            read_cmd.fork_id, read_cmd.offset, read_cmd.req_count
+        );
 
         let mut output_buf = [0u8; 4096];
 
         match our_volume.read(&read_cmd, &mut output_buf).await {
             Ok((bytes_read, is_eof)) => {
-                tracing::info!("Returning {bytes_read} bytes");
                 let mut result_code = [0u8; 4];
                 if is_eof && read_cmd.req_count > 0 {
                     // Sign-extend the i16 AFP error to u32 before getting bytes
                     result_code = (AfpError::EoFErr as i16 as i32 as u32).to_be_bytes();
                 }
-
+                debug!(
+                    "AFP FPRead resp: OK bytes_read={}, eof={}",
+                    bytes_read, is_eof
+                );
                 command.send_reply(AspCommandResponse {
                     result: result_code,
                     data: output_buf[..bytes_read].to_vec(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPRead resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -725,12 +896,16 @@ impl AspSession {
         let write_cmd = match tailtalk_packets::afp::FPWrite::parse(&command.data[2..]) {
             Ok(cmd) => cmd,
             Err(_) => {
+                debug!("AFP FPWrite resp: parse err=ParamError");
                 command.send_reply(create_error_reply(AfpError::ParamError))?;
                 return Ok(());
             }
         };
 
-        tracing::info!("Session {} FPWrite: {:?}", self.id, write_cmd);
+        debug!(
+            "AFP FPWrite req: fork_id={}, offset={}, req_count={}",
+            write_cmd.fork_id, write_cmd.offset, write_cmd.req_count
+        );
 
         // Perform SPWrite transaction to get the data
         // We ask for the amount the client wants to write
@@ -740,8 +915,7 @@ impl AspSession {
         {
             Ok(d) => d,
             Err(e) => {
-                tracing::error!("SPWrite failed: {:?}", e);
-                // If the pull failed, we can't really do much but fail the command
+                error!("AFP FPWrite SPWrite failed: {:?}", e);
                 command.send_reply(create_error_reply(AfpError::MiscErr))?;
                 return Ok(());
             }
@@ -757,13 +931,17 @@ impl AspSession {
                 let last_byte_offset = write_cmd.offset + bytes_written as u32;
                 let mut reply_data = [0u8; 4];
                 reply_data.copy_from_slice(&last_byte_offset.to_be_bytes());
-
+                debug!(
+                    "AFP FPWrite resp: OK bytes_written={}, last_byte_offset={}",
+                    bytes_written, last_byte_offset
+                );
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: reply_data.to_vec(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPWrite resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -779,14 +957,21 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
+        // Fork type is in bit 7 of the flag byte (command.data[1]):
+        // 0x00 = data fork, 0x80 = resource fork.
+        let fork_type = ForkType::from(command.data[1] & 0x80);
         let cmd = FPOpenFork::parse(&command.data[2..]).unwrap();
         let path_name_buf = PathBuf::from(cmd.path.to_string());
+        debug!(
+            "AFP FPOpenFork req: fork={:?}, dir_id={}, path={:?}, bitmap={:?}, access={:#06x}",
+            fork_type, cmd.directory_id, path_name_buf, cmd.file_bitmap, cmd.access_mode
+        );
 
         let mut output_buf = [0u8; 256];
 
         match our_volume
             .open_fork(
-                ForkType::Data, // We only support data fork
+                fork_type,
                 cmd.file_bitmap,
                 cmd.directory_id,
                 &path_name_buf,
@@ -794,14 +979,29 @@ impl AspSession {
             )
             .await
         {
-            Ok(offset) => Ok(command.send_reply(AspCommandResponse {
-                result: [0u8; 4],
-                data: output_buf[..offset].to_vec(),
-            })?),
-            Err(e) => Ok(command.send_reply(AspCommandResponse {
-                result: (e as u32).to_be_bytes(),
-                data: Vec::new(),
-            })?),
+            Ok(offset) => {
+                // Fork ref num is in bytes 2-3 of the response
+                let fork_ref = if offset >= 4 {
+                    u16::from_be_bytes([output_buf[2], output_buf[3]])
+                } else {
+                    0
+                };
+                debug!(
+                    "AFP FPOpenFork resp: OK fork_ref={}, {} bytes",
+                    fork_ref, offset
+                );
+                Ok(command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: output_buf[..offset].to_vec(),
+                })?)
+            }
+            Err(e) => {
+                debug!("AFP FPOpenFork resp: err={:?}", e);
+                Ok(command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?)
+            }
         }
     }
 
@@ -811,15 +1011,18 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let fork_cmd = FPCloseFork::parse(&command.data[2..]).unwrap();
+        debug!("AFP FPCloseFork req: fork_id={}", fork_cmd.fork_id);
 
         match our_volume.close_fork(fork_cmd.fork_id).await {
             Ok(_) => {
+                debug!("AFP FPCloseFork resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: Vec::new(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPCloseFork resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -836,15 +1039,21 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let fork_cmd = FPSetForkParms::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPSetForkParms req: fork_ref={}, data_len={:?}, rsrc_len={:?}",
+            fork_cmd.fork_ref_num, fork_cmd.data_fork_length, fork_cmd.resource_fork_length
+        );
 
         match our_volume.set_fork_parms(fork_cmd).await {
             Ok(_) => {
+                debug!("AFP FPSetForkParms resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: Vec::new(),
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPSetForkParms resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -861,6 +1070,10 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let cmd = FPGetForkParms::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPGetForkParms req: fork_id={}, bitmap={:?}",
+            cmd.fork_id, cmd.file_bitmap
+        );
 
         let mut output_buf = [0u8; 256];
 
@@ -869,14 +1082,20 @@ impl AspSession {
             .get_fork_parms(cmd.file_bitmap, cmd.fork_id, &mut output_buf[2..])
             .await
         {
-            Ok(offset) => Ok(command.send_reply(AspCommandResponse {
-                result: [0u8; 4],
-                data: output_buf[..offset + 2].to_vec(),
-            })?),
-            Err(e) => Ok(command.send_reply(AspCommandResponse {
-                result: (e as u32).to_be_bytes(),
-                data: Vec::new(),
-            })?),
+            Ok(offset) => {
+                debug!("AFP FPGetForkParms resp: OK {} param bytes", offset);
+                Ok(command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: output_buf[..offset + 2].to_vec(),
+                })?)
+            }
+            Err(e) => {
+                debug!("AFP FPGetForkParms resp: err={:?}", e);
+                Ok(command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?)
+            }
         }
     }
 
@@ -886,6 +1105,14 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let enumerate = FPEnumerate::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPEnumerate req: dir_id={}, path={:?}, start={}, req_count={}, max_reply={}",
+            enumerate.directory_id,
+            enumerate.path,
+            enumerate.start_index,
+            enumerate.req_count,
+            enumerate.max_reply_size
+        );
 
         let mut output_buf = [0u8; 5000];
         output_buf[..2].copy_from_slice(&enumerate.file_bitmap.bits().to_be_bytes());
@@ -897,14 +1124,35 @@ impl AspSession {
             .enumerate(enumerate, &mut output_buf[start_offset..])
             .await
         {
-            Ok(offset) => Ok(command.send_reply(AspCommandResponse {
-                result: [0u8; 4],
-                data: output_buf[..offset + start_offset].to_vec(),
-            })?),
-            Err(e) => Ok(command.send_reply(AspCommandResponse {
-                result: (e as u32).to_be_bytes(),
-                data: Vec::new(),
-            })?),
+            Ok(offset) => {
+                // Entry count is the first 2 bytes of the enumerate result
+                let count =
+                    u16::from_be_bytes([output_buf[start_offset], output_buf[start_offset + 1]]);
+                // AFP spec: when no entries are returned, signal end-of-directory with
+                // ObjectNotFound but still include the bitmap/count data so the client
+                // can distinguish this from a hard error.
+                let result = if count == 0 {
+                    (AfpError::ObjectNotFound as i16 as i32 as u32).to_be_bytes()
+                } else {
+                    [0u8; 4]
+                };
+                debug!(
+                    "AFP FPEnumerate resp: count={}, {} total bytes",
+                    count,
+                    offset + start_offset
+                );
+                Ok(command.send_reply(AspCommandResponse {
+                    result,
+                    data: output_buf[..offset + start_offset].to_vec(),
+                })?)
+            }
+            Err(e) => {
+                debug!("AFP FPEnumerate resp: err={:?}", e);
+                Ok(command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?)
+            }
         }
     }
 
@@ -916,39 +1164,35 @@ impl AspSession {
     ) -> anyhow::Result<Option<AfpVersion>> {
         match tailtalk_packets::afp::FPLogin::parse(data) {
             Ok(login) => {
-                info!(
-                    "Session {} FPLogin: version={:?}",
-                    self.id, login.afp_version
+                debug!(
+                    "AFP FPLogin req: version={:?}, uam={:?}",
+                    login.afp_version, login.auth
                 );
 
                 let negotiated = login.afp_version.clone();
 
                 match login.auth {
                     tailtalk_packets::afp::FPLoginAuth::NoUserAuthent => {
-                        info!("Session {} login: No User Authentication", self.id);
-                        // Success: cmdResult=0, sessRefnum=session_id
                         let reply = create_login_success_reply(self.id as i16);
+                        debug!("AFP FPLogin resp: OK sess_ref={} (NoUserAuthent)", self.id);
                         command.send_reply(reply)?;
-                        info!("Session {} login accepted", self.id);
                     }
                     tailtalk_packets::afp::FPLoginAuth::CleartxtPasswrd {
                         ref username, ..
                     } => {
-                        info!(
-                            "Session {} login: Clear Text Password, user={}",
+                        let reply = create_login_success_reply(self.id as i16);
+                        debug!(
+                            "AFP FPLogin resp: OK sess_ref={} (CleartxtPasswrd user={})",
                             self.id, username
                         );
-                        // For demo purposes, accept any password
-                        let reply = create_login_success_reply(self.id as i16);
                         command.send_reply(reply)?;
-                        info!("Session {} login accepted", self.id);
                     }
                 }
 
                 Ok(Some(negotiated))
             }
             Err(e) => {
-                warn!("Session {} FPLogin parse error: {:?}", self.id, e);
+                warn!("AFP FPLogin resp: parse err={:?}", e);
                 command.send_reply(create_error_reply(e))?;
                 Ok(None)
             }
@@ -961,16 +1205,25 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let get_icon = tailtalk_packets::afp::FPGetIcon::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPGetIcon req: dt_ref={}, creator={:#010x}, type={:#010x}, icon_type={}, size={}",
+            get_icon.dt_ref_num,
+            u32::from_be_bytes(get_icon.file_creator),
+            u32::from_be_bytes(get_icon.file_type),
+            get_icon.icon_type,
+            get_icon.size
+        );
 
         match our_volume.get_icon(get_icon.dt_ref_num, &get_icon) {
             Ok(data) => {
+                debug!("AFP FPGetIcon resp: OK {} bytes", data.len());
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data,
                 })?;
             }
             Err(e) => {
-                // AfpError is an i16 as per spec for results
+                debug!("AFP FPGetIcon resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -988,9 +1241,19 @@ impl AspSession {
     ) -> anyhow::Result<()> {
         let get_icon_info =
             tailtalk_packets::afp::FPGetIconInfo::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPGetIconInfo req: dt_ref={}, creator={:#010x}, icon_type={}",
+            get_icon_info.dt_ref_num,
+            u32::from_be_bytes(get_icon_info.file_creator),
+            get_icon_info.icon_type
+        );
 
         match our_volume.get_icon_info(get_icon_info.dt_ref_num, &get_icon_info) {
             Ok((icon_tag, file_type, size)) => {
+                debug!(
+                    "AFP FPGetIconInfo resp: OK tag={:#010x}, type={:#010x}, size={}",
+                    icon_tag, file_type, size
+                );
                 let mut output = [0u8; 10];
                 output[0..4].copy_from_slice(&icon_tag.to_be_bytes());
                 output[4..8].copy_from_slice(&file_type.to_be_bytes());
@@ -1002,6 +1265,7 @@ impl AspSession {
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPGetIconInfo resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -1018,6 +1282,14 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let add_icon = tailtalk_packets::afp::FPAddIcon::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPAddIcon req: dt_ref={}, creator={:#010x}, type={:#010x}, icon_type={}, size={}",
+            add_icon.dt_ref_num,
+            u32::from_be_bytes(add_icon.file_creator),
+            u32::from_be_bytes(add_icon.file_type),
+            add_icon.icon_type,
+            add_icon.size
+        );
 
         let data = match self
             .write(add_icon.size as usize, command.sequence_number)
@@ -1025,7 +1297,7 @@ impl AspSession {
         {
             Ok(d) => d,
             Err(e) => {
-                tracing::error!("SPWrite failed for AddIcon: {:?}", e);
+                error!("AFP FPAddIcon SPWrite failed: {:?}", e);
                 command.send_reply(create_error_reply(AfpError::MiscErr))?;
                 return Ok(());
             }
@@ -1033,12 +1305,14 @@ impl AspSession {
 
         match our_volume.add_icon(add_icon.dt_ref_num, &add_icon, &data) {
             Ok(_) => {
+                debug!("AFP FPAddIcon resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPAddIcon resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -1055,8 +1329,12 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let add_comment = tailtalk_packets::afp::FPAddComment::parse(&command.data[2..]).unwrap();
-
-        tracing::info!("Add Comment command: {:?}", add_comment);
+        debug!(
+            "AFP FPAddComment req: dir_id={}, path={:?}, comment={:?}",
+            add_comment.directory_id,
+            add_comment.path.as_str(),
+            add_comment.comment
+        );
 
         match our_volume.set_comment(
             add_comment.directory_id,
@@ -1064,12 +1342,14 @@ impl AspSession {
             &add_comment.comment,
         ) {
             Ok(_) => {
+                debug!("AFP FPAddComment resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPAddComment resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -1086,14 +1366,18 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let get_comment = tailtalk_packets::afp::FPGetComment::parse(&command.data[2..]).unwrap();
-
-        tracing::info!("Get Comment command: {:?}", get_comment);
+        debug!(
+            "AFP FPGetComment req: dir_id={}, path={:?}",
+            get_comment.directory_id,
+            get_comment.path.as_str()
+        );
 
         match our_volume.get_comment(
             get_comment.directory_id,
             &PathBuf::from(get_comment.path.as_str()),
         ) {
             Ok(comment) => {
+                debug!("AFP FPGetComment resp: OK {} bytes", comment.len());
                 let mut data = vec![];
                 data.push(comment.len() as u8);
                 data.extend_from_slice(&comment);
@@ -1103,6 +1387,7 @@ impl AspSession {
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPGetComment resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -1120,18 +1405,25 @@ impl AspSession {
     ) -> anyhow::Result<()> {
         let remove_comment =
             tailtalk_packets::afp::FPRemoveComment::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPRemoveComment req: dir_id={}, path={:?}",
+            remove_comment.directory_id,
+            remove_comment.path.as_str()
+        );
 
         match our_volume.remove_comment(
             remove_comment.directory_id,
             &PathBuf::from(remove_comment.path.as_str()),
         ) {
             Ok(_) => {
+                debug!("AFP FPRemoveComment resp: OK");
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data: vec![],
                 })?;
             }
             Err(e) => {
+                debug!("AFP FPRemoveComment resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as i32).to_be_bytes(),
                     data: Vec::new(),
@@ -1145,9 +1437,12 @@ impl AspSession {
 
 /// Create a successful login reply
 fn create_login_success_reply(session_ref_num: i16) -> AspCommandResponse {
+    let mut data = session_ref_num.to_be_bytes().to_vec();
+    data.extend_from_slice(&[0, 0]); // Append 2-byte IDNumber (unused for NoUserAuthent/Cleartxt)
+
     AspCommandResponse {
         result: [0u8; 4],
-        data: session_ref_num.to_be_bytes().to_vec(),
+        data,
     }
 }
 
@@ -1158,5 +1453,44 @@ fn create_error_reply(error: AfpError) -> AspCommandResponse {
     AspCommandResponse {
         result: (error_code as i32).to_be_bytes(),
         data: vec![],
+    }
+}
+
+fn afp_cmd_name(code: u8) -> &'static str {
+    match code {
+        1 => "FPByteRangeLock",
+        2 => "FPCloseVol",
+        4 => "FPCloseFork",
+        6 => "FPCreateDir",
+        7 => "FPCreateFile",
+        8 => "FPDelete",
+        9 => "FPEnumerate",
+        10 => "FPFlush",
+        14 => "FPGetForkParms",
+        16 => "FPGetSrvrParms",
+        17 => "FPGetVolParms",
+        18 => "FPLogin",
+        20 => "FPLogout",
+        23 => "FPMoveAndRename",
+        24 => "FPOpenVol",
+        26 => "FPOpenFork",
+        27 => "FPRead",
+        28 => "FPRename",
+        29 => "FPSetDirParms",
+        31 => "FPSetForkParms",
+        33 => "FPWrite",
+        34 => "FPGetFileDirParms",
+        35 => "FPSetFileDirParms",
+        38 => "FPGetSrvrMsg",
+        48 => "FPOpenDT",
+        49 => "FPCloseDT",
+        51 => "FPGetIcon",
+        52 => "FPGetIconInfo",
+        53 => "FPAddAPPL",
+        56 => "FPAddComment",
+        57 => "FPRemoveComment",
+        58 => "FPGetComment",
+        192 => "FPAddIcon",
+        _ => "FPUnknown",
     }
 }

@@ -68,6 +68,7 @@ struct AspState {
     match_addr_only: bool, // For future strict checking
     // Channel to send commands to the session owner
     command_tx: mpsc::Sender<AspCommand>,
+    last_activity: tokio::time::Instant,
 }
 
 // Public handle for a connected session (returned to user)
@@ -188,7 +189,6 @@ impl Asp {
                     }
                 };
                 {
-                let header = header; // shadow to keep existing match block structure
                     match header.function {
                         SPFunction::GetStatus => {
                             tracing::info!("ASP responding to GetStatus request");
@@ -231,6 +231,7 @@ impl Asp {
                                         addr: req.source,
                                         match_addr_only: true,
                                         command_tx,
+                                        last_activity: tokio::time::Instant::now(),
                                     },
                                 );
 
@@ -301,6 +302,7 @@ impl Asp {
                         SPFunction::Command | SPFunction::Write => {
                             let session_id = header.session_id;
                             if let Some(sess) = sessions.get_mut(&session_id) {
+                                sess.last_activity = tokio::time::Instant::now();
                                 // Verify command is from the session owner (only check net+node, ignore socket)
                                 if sess.addr.network_number == req.source.network_number
                                     && sess.addr.node_number == req.source.node_number
@@ -366,30 +368,15 @@ impl Asp {
                             }
                         }
                         SPFunction::Tickle => {
+                            // Tickle is ATP ALO — no reply is needed per the ASP spec.
+                            // Just reset the session watchdog timer.
                             let session_id = header.session_id;
-                            if let Some(sess) = sessions.get(&session_id) {
-                                // Verify tickle is from the session owner (only check net+node, ignore socket)
-                                if sess.addr.network_number == req.source.network_number
-                                    && sess.addr.node_number == req.source.node_number
-                                {
-                                    tracing::debug!(
-                                        "ASP Tickle received for session {}",
-                                        session_id
-                                    );
-
-                                    // Respond with success to acknowledge the tickle
-                                    let response_user_bytes = [0, session_id, 0, 0];
-                                    let _ = req.send_response(vec![], response_user_bytes).await;
-                                } else {
-                                    tracing::warn!(
-                                        "ASP Tickle mismatch: Session {} owned by {}.{}, req from {}.{}",
-                                        session_id,
-                                        sess.addr.network_number,
-                                        sess.addr.node_number,
-                                        req.source.network_number,
-                                        req.source.node_number
-                                    );
-                                }
+                            if let Some(sess) = sessions.get_mut(&session_id) {
+                                sess.last_activity = tokio::time::Instant::now();
+                                tracing::debug!(
+                                    "ASP Tickle received for session {}, watchdog reset",
+                                    session_id
+                                );
                             } else {
                                 tracing::warn!("ASP Tickle: Session {} not found", session_id);
                             }
@@ -403,7 +390,14 @@ impl Asp {
 
                     // ── 30-second tickle timer ───────────────────────────────────
                     _ = tickle_interval.tick() => {
+                        let mut dead_sessions = Vec::new();
                         for (session_id, sess) in &sessions {
+                            if sess.last_activity.elapsed() > std::time::Duration::from_secs(120) {
+                                tracing::warn!("ASP Session {} timed out due to inactivity", session_id);
+                                dead_sessions.push(*session_id);
+                                continue;
+                            }
+
                             tracing::debug!("ASP sending Tickle to session {}", session_id);
                             let user_bytes = [
                                 SPFunction::Tickle as u8,
@@ -412,6 +406,10 @@ impl Asp {
                                 0,
                             ];
                             let _ = atp_req_clone.send_alo(sess.addr, user_bytes).await;
+                        }
+
+                        for session_id in dead_sessions {
+                            sessions.remove(&session_id);
                         }
                     }
                 } // end select!

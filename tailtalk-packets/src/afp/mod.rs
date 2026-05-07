@@ -30,7 +30,7 @@ mod tests {
 
         let bytes = status.to_bytes().expect("Serialization failed");
 
-        assert_eq!(bytes.len(), 389);
+        assert_eq!(bytes.len(), 368);
 
         let parsed = FPGetSrvrInfo::parse(&bytes).expect("Parsing failed");
 

@@ -253,7 +253,6 @@ impl PacketProcessor {
                                 let payload = &data[EtherTalkPhase2Frame::len()..];
                                 match header.protocol {
                                     EtherTalkPhase2Type::Ddp => {
-                                        tracing::info!("EtherTalk Phase 2 DDP received");
                                         ddp_rx.received_pkt(
                                             payload,
                                             aarp::AddressSource::EtherTalkPhase2,
@@ -261,7 +260,6 @@ impl PacketProcessor {
                                         );
                                     }
                                     EtherTalkPhase2Type::Aarp => {
-                                        tracing::info!("EtherTalk Phase 2 AARP received");
                                         if let Err(e) = addressing_rx.received_pkt(
                                             payload,
                                             aarp::AddressSource::EtherTalkPhase2,
@@ -274,58 +272,58 @@ impl PacketProcessor {
                         }
                     } else if ethertype_or_len == 0x80F3 {
                         // EtherTalk Phase 1 AARP.
-                        if data.len() > 14 {
-                            if let Err(e) = addressing_rx.received_pkt(
+                        if data.len() > 14
+                            && let Err(e) = addressing_rx.received_pkt(
                                 &data[14..],
                                 aarp::AddressSource::EtherTalkPhase1,
-                            ) {
-                                tracing::error!("failed to relay Phase 1 AARP: {e}");
-                            }
+                            )
+                        {
+                            tracing::error!("failed to relay Phase 1 AARP: {e}");
                         }
                     } else if ethertype_or_len == 0x809B {
                         // EtherTalk Phase 1 – LLAP encapsulated in Ethernet.
-                        if data.len() > 14 + LlapPacket::LEN {
-                            if let Ok(llap) = LlapPacket::parse(&data[14..]) {
-                                match llap.type_ {
-                                    LlapType::DdpShort => {
-                                        let payload = &data[(14 + LlapPacket::LEN)..];
-                                        if payload.len() >= 5 {
-                                            if let Ok(headers) = DdpPacket::parse_short(
-                                                payload,
-                                                llap.dst_node,
-                                                llap.src_node,
-                                            ) {
-                                                let ddp_payload = payload[5..].into();
-                                                let source_mac: [u8; 6] =
-                                                    data[6..12].try_into().unwrap();
-                                                ddp_rx.received_parsed_pkt(
-                                                    headers,
-                                                    ddp_payload,
-                                                    aarp::AddressSource::EtherTalkPhase1,
-                                                    source_mac,
-                                                );
-                                            }
-                                        }
+                        if data.len() > 14 + LlapPacket::LEN
+                            && let Ok(llap) = LlapPacket::parse(&data[14..])
+                        {
+                            match llap.type_ {
+                                LlapType::DdpShort => {
+                                    let payload = &data[(14 + LlapPacket::LEN)..];
+                                    if payload.len() >= 5
+                                        && let Ok(headers) = DdpPacket::parse_short(
+                                            payload,
+                                            llap.dst_node,
+                                            llap.src_node,
+                                        )
+                                    {
+                                        let ddp_payload = payload[5..].into();
+                                        let source_mac: [u8; 6] =
+                                            data[6..12].try_into().unwrap();
+                                        ddp_rx.received_parsed_pkt(
+                                            headers,
+                                            ddp_payload,
+                                            aarp::AddressSource::EtherTalkPhase1,
+                                            source_mac,
+                                        );
                                     }
-                                    LlapType::DdpLong => {
-                                        let payload = &data[(14 + LlapPacket::LEN)..];
-                                        if payload.len() >= DdpPacket::LEN {
-                                            if let Ok(headers) = DdpPacket::parse(payload) {
-                                                let ddp_payload =
-                                                    payload[DdpPacket::LEN..].into();
-                                                let source_mac: [u8; 6] =
-                                                    data[6..12].try_into().unwrap();
-                                                ddp_rx.received_parsed_pkt(
-                                                    headers,
-                                                    ddp_payload,
-                                                    aarp::AddressSource::EtherTalkPhase1,
-                                                    source_mac,
-                                                );
-                                            }
-                                        }
-                                    }
-                                    _ => {}
                                 }
+                                LlapType::DdpLong => {
+                                    let payload = &data[(14 + LlapPacket::LEN)..];
+                                    if payload.len() >= DdpPacket::LEN
+                                        && let Ok(headers) = DdpPacket::parse(payload)
+                                    {
+                                        let ddp_payload =
+                                            payload[DdpPacket::LEN..].into();
+                                        let source_mac: [u8; 6] =
+                                            data[6..12].try_into().unwrap();
+                                        ddp_rx.received_parsed_pkt(
+                                            headers,
+                                            ddp_payload,
+                                            aarp::AddressSource::EtherTalkPhase1,
+                                            source_mac,
+                                        );
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -555,7 +553,8 @@ impl PacketProcessor {
             match pkt.dest_node {
                 addressing::Node::EtherTalkPhase1(_) | addressing::Node::EtherTalkPhase2(_) => {
                     if let Some(ref mut tx) = pcap_tx {
-                        if let Err(e) = tx.sendpacket(&output_buf[..final_size]) {
+                        let padded_size = final_size.max(60);
+                        if let Err(e) = tx.sendpacket(&output_buf[..padded_size]) {
                             tracing::error!("failed to send packet: {e}");
                         }
                     }

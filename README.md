@@ -60,10 +60,8 @@ not work with AFP (The Mac will discover the AFP TailTalk server but our respons
 
 ## Known Issues
 
-* Files copied from us to a Mac have weird file layouts even after moving them around.
-* Macs with a connected AFP volume seem to stall when trying to do a reboot if the volume is still connected.
-* Multiple AFP sessions are not properly supported yet. After a Mac disconnects the server should be restarted.
-* AFP node IDs use a crude name hashing mechanism that can lead to collisions.
+* Multiple AFP sessions are not properly supported yet - whilst it can support two or more clients at once
+  the server can/will ask strangely. 
 
 ## Contributing
 

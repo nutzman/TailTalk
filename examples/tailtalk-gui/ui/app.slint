@@ -13,6 +13,7 @@ export component AppWindow inherits Window {
     in property <[string]> tashtalk-ports;
     in-out property <int> selected-tashtalk: 0;
     in-out property <string> volume-path;
+    in-out property <string> volume-name: "MacShare";
     in-out property <bool> tashtalk-crc-checking: false;
     in-out property <bool> tashtalk-crc-generation: false;
     in property <bool> running: false;
@@ -86,6 +87,16 @@ export component AppWindow inherits Window {
                         text: "Browse…";
                         enabled: !root.running;
                         clicked => { root.browse-volume(); }
+                    }
+                }
+
+                HorizontalBox {
+                    Text { text: "Volume Name:"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.volume-name;
+                        placeholder-text: "MacShare";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
                     }
                 }
             }

@@ -177,6 +177,7 @@ bitflags! {
         const FILE_NUMBER = 1 << 8;
         const DATA_FORK_LENGTH = 1 << 9;
         const RESOURCE_FORK_LENGTH = 1 << 10;
+        const ACCESS_RIGHTS = 1 << 12;
         const PRODOS_INFO = 1 << 13;
     }
 }
@@ -302,6 +303,34 @@ impl From<u8> for FPAccessRights {
     fn from(value: u8) -> Self {
         Self::from_bits_truncate(value)
     }
+}
+
+pub fn afp_rights_to_mode(rights: FPAccessRights) -> u32 {
+    let mut mode = 0;
+    if rights.contains(FPAccessRights::READ) {
+        mode |= 4;
+    }
+    if rights.contains(FPAccessRights::WRITE) {
+        mode |= 2;
+    }
+    if rights.contains(FPAccessRights::SEARCH) {
+        mode |= 1;
+    }
+    mode
+}
+
+pub fn mode_to_afp_rights(mode: u32) -> FPAccessRights {
+    let mut rights = FPAccessRights::empty();
+    if mode & 4 != 0 {
+        rights |= FPAccessRights::READ;
+    }
+    if mode & 2 != 0 {
+        rights |= FPAccessRights::WRITE;
+    }
+    if mode & 1 != 0 {
+        rights |= FPAccessRights::SEARCH;
+    }
+    rights
 }
 
 impl From<FPAccessRights> for u8 {

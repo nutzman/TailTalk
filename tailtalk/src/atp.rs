@@ -107,7 +107,7 @@ impl AtpReceivedRequest {
         } else {
             self.bitmap
         };
-        let max_packets = (effective_bitmap.count_ones() as usize).min(8).max(1);
+        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
         let max_data = max_packets * ATP_MAX_DATA_PER_PACKET;
 
         if data.len() > max_data {
@@ -235,7 +235,7 @@ impl Atp {
         let actual_socket = sock.socket_num();
 
         let (request_send, request_recv) = mpsc::channel(100);
-        let (incoming_req_tx, incoming_req_rx) = mpsc::channel(1); // Capacity 1 queue
+        let (incoming_req_tx, incoming_req_rx) = mpsc::channel(32);
 
         let atp = Atp {
             sock,
@@ -517,7 +517,7 @@ impl Atp {
                 };
 
                 if let Err(e) = self.incoming_req_tx.try_send(req) {
-                    tracing::debug!("Dropping incoming ATP request, queue full: {}", e);
+                    tracing::warn!("Dropping incoming ATP request (queue full): {}", e);
                 }
             }
             AtpFunction::Response => {
