@@ -365,7 +365,7 @@ impl DdpHandle {
 
     pub fn received_pkt(&self, pkt: &[u8], source: AppleTalkAddressSource, source_mac: [u8; 6]) {
         if let Ok(headers) = DdpHeaders::parse(pkt) {
-            let payload = pkt[DdpHeaders::LEN..].into();
+            let payload = pkt[DdpHeaders::LEN..headers.len.min(pkt.len())].into();
 
             let _ = self.command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
                 headers,

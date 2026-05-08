@@ -295,7 +295,7 @@ impl PacketProcessor {
                                             llap.src_node,
                                         )
                                     {
-                                        let ddp_payload = payload[5..].into();
+                                        let ddp_payload = payload[5..headers.len.min(payload.len())].into();
                                         let source_mac: [u8; 6] =
                                             data[6..12].try_into().unwrap();
                                         ddp_rx.received_parsed_pkt(
@@ -312,7 +312,7 @@ impl PacketProcessor {
                                         && let Ok(headers) = DdpPacket::parse(payload)
                                     {
                                         let ddp_payload =
-                                            payload[DdpPacket::LEN..].into();
+                                            payload[DdpPacket::LEN..headers.len.min(payload.len())].into();
                                         let source_mac: [u8; 6] =
                                             data[6..12].try_into().unwrap();
                                         ddp_rx.received_parsed_pkt(
@@ -406,7 +406,8 @@ impl PacketProcessor {
                                                         llap,
                                                         headers
                                                     );
-                                                    let payload = data[8..].to_vec().into_boxed_slice();
+                                                    let end = (3 + headers.len).min(data.len());
+                                                    let payload = data[8..end].to_vec().into_boxed_slice();
                                                     ddp_handle.received_parsed_pkt(
                                                         headers,
                                                         payload,
@@ -418,8 +419,9 @@ impl PacketProcessor {
                                             LlapType::DdpLong => {
                                                 tracing::info!("TashTalk: LocalTalk DDP Long");
                                                 if let Ok(headers) = DdpPacket::parse(&data[3..]) {
+                                                    let end = (3 + headers.len).min(data.len());
                                                     let payload =
-                                                        data[(3 + DdpPacket::LEN)..].to_vec().into_boxed_slice();
+                                                        data[(3 + DdpPacket::LEN)..end].to_vec().into_boxed_slice();
                                                     ddp_handle.received_parsed_pkt(
                                                         headers,
                                                         payload,
