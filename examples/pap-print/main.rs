@@ -44,9 +44,6 @@ async fn main() -> anyhow::Result<()> {
     let (_req_sock, atp_requestor, _) = Atp::spawn(&stack.ddp, None).await;
     let (_resp_sock, _, atp_responder) = Atp::spawn(&stack.ddp, None).await;
 
-    // Give AARP a moment to acquire a node address
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     // Locate the printer via NBP
     println!("Looking up printer '{}'...", entity);
     let tuples = stack.nbp.lookup(entity).await?;

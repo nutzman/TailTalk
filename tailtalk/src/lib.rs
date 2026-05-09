@@ -685,6 +685,11 @@ impl TalkStackBuilder {
 
         tokio::spawn(processor.run(addressing.clone(), ddp.clone()));
 
+        // Wait until AARP has confirmed our node address before returning.
+        // Without this, callers could attempt to send packets before addressing
+        // is ready, especially when probing is required (no fixed address).
+        addressing.addr().await?;
+
         Ok(TalkStack { addressing, ddp, nbp, echo })
     }
 }

@@ -30,9 +30,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("failed to build AppleTalk stack");
 
-    // Give AARP a moment to acquire a node address
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     let addr = AppleTalkAddress {
         network_number: args.network,
         node_number: args.node,

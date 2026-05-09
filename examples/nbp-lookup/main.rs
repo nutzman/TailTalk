@@ -32,9 +32,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("failed to build AppleTalk stack");
 
-    // Give AARP a moment to acquire a node address before sending lookups
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
     println!("Looking up '{}'...", entity);
     match stack.nbp.lookup(entity).await {
         Ok(tuples) => {
