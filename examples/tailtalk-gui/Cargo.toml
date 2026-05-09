@@ -22,3 +22,22 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 slint-build = "1"
+
+[package.metadata.packager]
+product_name = "TailTalk"
+identifier = "com.tailtalk.app"
+formats = ["app", "dmg", "appimage"]
+out_dir = "../../dist"
+# icons = ["icons/icon.icns"]
+
+[[package.metadata.packager.binaries]]
+path = "tailtalk-gui"
+main = true
+
+[package.metadata.packager.macos]
+minimum_system_version = "11.0"
+
+[package.metadata.packager.dmg]
+window_size = { width = 540, height = 380 }
+app_position = { x = 130, y = 220 }
+application_folder_position = { x = 410, y = 220 }
