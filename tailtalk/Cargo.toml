@@ -2,6 +2,11 @@
 name = "tailtalk"
 version = "0.1.0"
 edition = "2024"
+license-file = "../LICENSE"
+description = "A modern async user space AppleTalk stack with Rust + Tokio "
+author = "FeralFirmware"
+repository = "https://github.com/feralfirmware/tailtalk"
+readme = "../README.md"
 
 [lib]
 name = "tailtalk"
