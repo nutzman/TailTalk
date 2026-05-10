@@ -1692,6 +1692,82 @@ impl Volume {
         Ok(())
     }
 
+    /// Server-side copy of a file's data fork (and resource fork sidecar if present)
+    /// into a destination directory.
+    ///
+    /// Returns the new node's ID on success.
+    pub async fn copy_file(
+        &mut self,
+        src_dir_id: u32,
+        src_path: &Path,
+        dst_dir_id: u32,
+        dst_path: &Path,
+        new_name: &str,
+    ) -> Result<u32, AfpError> {
+        let src_node_id = self.resolve_node(src_dir_id, src_path)?;
+
+        let (src_is_dir, src_relative, src_name) = {
+            let n = self.nodes.get(&src_node_id).ok_or(AfpError::ObjectNotFound)?;
+            if n.is_dir {
+                return Err(AfpError::ObjectTypeErr);
+            }
+            (n.is_dir, n.path.clone(), n.name.clone())
+        };
+        let _ = src_is_dir;
+
+        let dst_node_id = self.resolve_node(dst_dir_id, dst_path)?;
+        let dst_relative = {
+            let n = self.nodes.get(&dst_node_id).ok_or(AfpError::ObjectNotFound)?;
+            if !n.is_dir {
+                return Err(AfpError::ObjectTypeErr);
+            }
+            n.path.clone()
+        };
+
+        let effective_name = if new_name.is_empty() { &src_name } else { new_name };
+
+        let new_relative = dst_relative.join(effective_name);
+        if self.path_to_id.contains_key(&new_relative) {
+            return Err(AfpError::ObjectExists);
+        }
+
+        let src_absolute = self.path.join(&src_relative);
+        let dst_absolute = self.path.join(&new_relative);
+
+        tokio::fs::copy(&src_absolute, &dst_absolute).await.map_err(|e| {
+            error!("copy_file {:?} → {:?}: {:?}", src_absolute, dst_absolute, e);
+            AfpError::AccessDenied
+        })?;
+
+        // Copy resource fork sidecar if it exists.
+        let src_sidecar = rsrc_path(&self.path, &src_relative);
+        if src_sidecar.exists() {
+            let dst_sidecar = rsrc_path(&self.path, &new_relative);
+            if let Some(parent) = dst_sidecar.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let _ = tokio::fs::copy(&src_sidecar, &dst_sidecar).await;
+        }
+
+        let new_id = self.next_id;
+        self.next_id += 1;
+
+        let node = Node {
+            id: new_id,
+            parent_id: dst_node_id,
+            name: effective_name.to_string(),
+            is_dir: false,
+            path: new_relative.clone(),
+            data_fork: None,
+            resource_fork: None,
+        };
+
+        self.nodes.insert(new_id, node);
+        self.path_to_id.insert(new_relative, new_id);
+
+        Ok(new_id)
+    }
+
     /// Sync all open file handles to disk.
     ///
     /// This ensures that both file content and metadata are written to persistent storage

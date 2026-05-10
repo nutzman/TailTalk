@@ -5,11 +5,11 @@ use crate::nbp::NbpHandle;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tailtalk_packets::afp::{
-    AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME, AfpError, AfpUam, AfpVersion,
-    FPByteRangeLock, FPCloseFork, FPCreateDir, FPCreateFile, FPDelete, FPDirectoryBitmap,
-    FPEnumerate, FPFileBitmap, FPFlush, FPGetFileDirParms, FPGetForkParms, FPGetSrvrInfo,
-    FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead, FPRename, FPSetDirParms,
-    FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
+    AFP_CMD_COPY_FILE, AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME, AfpError, AfpUam,
+    AfpVersion, FPByteRangeLock, FPCloseFork, FPCopyFile, FPCreateDir, FPCreateFile, FPDelete,
+    FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPFlush, FPGetFileDirParms, FPGetForkParms,
+    FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead, FPRename,
+    FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
 };
 use tailtalk_packets::nbp::EntityName;
 use tracing::{debug, error, info, warn};
@@ -196,6 +196,9 @@ impl AspSession {
                 tailtalk_packets::afp::AFP_CMD_BYTE_RANGE_LOCK => {
                     self.handle_byte_range_lock(command, &mut our_volume)
                         .await?;
+                }
+                AFP_CMD_COPY_FILE => {
+                    self.handle_copy_file(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_LOGIN => {
                     let data = command.data[1..].to_vec();
@@ -501,6 +504,67 @@ impl AspSession {
             }
             Err(e) => {
                 debug!("AFP FPCreateFile resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as u32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_copy_file(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = match FPCopyFile::parse(&command.data[2..]) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("AFP FPCopyFile resp: parse err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        let src_path = PathBuf::from(cmd.src_path.to_string());
+        let dst_path = PathBuf::from(cmd.dst_path.to_string());
+        debug!(
+            "AFP FPCopyFile req: src_vol={}, src_dir={}, dst_vol={}, dst_dir={}, src={:?}, dst={:?}, new_name={:?}",
+            cmd.src_volume_id, cmd.src_directory_id, cmd.dst_volume_id, cmd.dst_directory_id,
+            src_path, dst_path, cmd.new_name
+        );
+
+        // We only support single-volume copies.
+        if cmd.src_volume_id != cmd.dst_volume_id
+            && cmd.src_volume_id != 0
+            && cmd.dst_volume_id != 0
+        {
+            debug!("AFP FPCopyFile resp: err=ParamError (cross-volume)");
+            command.send_reply(create_error_reply(AfpError::ParamError))?;
+            return Ok(());
+        }
+
+        match our_volume
+            .copy_file(
+                cmd.src_directory_id,
+                &src_path,
+                cmd.dst_directory_id,
+                &dst_path,
+                cmd.new_name.as_str(),
+            )
+            .await
+        {
+            Ok(_) => {
+                debug!("AFP FPCopyFile resp: OK");
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: vec![],
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPCopyFile resp: err={:?}", e);
                 command.send_reply(AspCommandResponse {
                     result: (e as u32).to_be_bytes(),
                     data: Vec::new(),
@@ -1461,6 +1525,7 @@ fn afp_cmd_name(code: u8) -> &'static str {
         1 => "FPByteRangeLock",
         2 => "FPCloseVol",
         4 => "FPCloseFork",
+        5 => "FPCopyFile",
         6 => "FPCreateDir",
         7 => "FPCreateFile",
         8 => "FPDelete",

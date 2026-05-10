@@ -8,6 +8,7 @@ use crate::afp::{
 /// AFP Command Codes
 pub const AFP_CMD_BYTE_RANGE_LOCK: u8 = 1;
 pub const AFP_CMD_CLOSE_VOL: u8 = 2;
+pub const AFP_CMD_COPY_FILE: u8 = 5;
 pub const AFP_CMD_CLOSE_FORK: u8 = 4;
 pub const AFP_CMD_CREATE_DIR: u8 = 6;
 pub const AFP_CMD_CREATE_FILE: u8 = 7;
@@ -1171,6 +1172,82 @@ impl FPRename {
             directory_id,
             path_type,
             path,
+            new_name_path_type,
+            new_name,
+        })
+    }
+}
+
+/// FPCopyFile: server-side copy of a file's data and resource forks into a destination directory.
+///
+/// Wire layout (from buf[2..] — after command byte and pad):
+///   [0..2]  SrcVolumeID
+///   [2..6]  SrcDirectoryID
+///   [6..8]  DstVolumeID
+///   [8..12] DstDirectoryID
+///   [12]    SrcPathType
+///   [13..]  SrcPath (Pascal string)
+///   [after src] DstPathType
+///   [after src+1..] DstPath  (Pascal string — the destination directory path, may be empty)
+///   [after dst] NewNamePathType
+///   [after dst+1..] NewName  (Pascal string — empty means keep source name)
+#[derive(Debug)]
+pub struct FPCopyFile {
+    pub src_volume_id: u16,
+    pub src_directory_id: u32,
+    pub dst_volume_id: u16,
+    pub dst_directory_id: u32,
+    pub src_path_type: PathType,
+    pub src_path: MacString,
+    pub dst_path_type: PathType,
+    pub dst_path: MacString,
+    pub new_name_path_type: PathType,
+    /// New name for the copy. Empty means keep the source file name.
+    pub new_name: MacString,
+}
+
+impl FPCopyFile {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 14 {
+            return Err(AfpError::InvalidSize);
+        }
+        let src_volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let src_directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let dst_volume_id = u16::from_be_bytes(*buf[6..8].as_array().unwrap());
+        let dst_directory_id = u32::from_be_bytes(*buf[8..12].as_array().unwrap());
+
+        let src_path_type = PathType::from(buf[12]);
+        let src_path = MacString::try_from(&buf[13..])?;
+
+        let dst_type_offset = 13 + src_path.byte_len();
+        if dst_type_offset >= buf.len() {
+            return Err(AfpError::InvalidSize);
+        }
+        let dst_path_type = PathType::from(buf[dst_type_offset]);
+        let dst_path = MacString::try_from(&buf[dst_type_offset + 1..])?;
+
+        let new_name_type_offset = dst_type_offset + 1 + dst_path.byte_len();
+        let (new_name_path_type, new_name) = if new_name_type_offset < buf.len() {
+            let nnt = PathType::from(buf[new_name_type_offset]);
+            let nn = if new_name_type_offset + 1 < buf.len() {
+                MacString::try_from(&buf[new_name_type_offset + 1..])?
+            } else {
+                MacString::from("")
+            };
+            (nnt, nn)
+        } else {
+            (PathType::LongName, MacString::from(""))
+        };
+
+        Ok(Self {
+            src_volume_id,
+            src_directory_id,
+            dst_volume_id,
+            dst_directory_id,
+            src_path_type,
+            src_path,
+            dst_path_type,
+            dst_path,
             new_name_path_type,
             new_name,
         })
