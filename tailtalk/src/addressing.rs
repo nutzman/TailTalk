@@ -127,8 +127,7 @@ impl Addressing {
             // Outer loop retries with a new random address on conflict.
             'probe: loop {
                 let node_num = {
-                    let mut rng = rand::thread_rng();
-                    rng.gen_range(1..=254)
+                    rand::rng().random_range(1..=254)
                 };
                 let addr = AppleTalkAddress {
                     network_number: 1,

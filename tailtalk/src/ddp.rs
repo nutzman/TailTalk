@@ -150,8 +150,7 @@ impl DdpProcessor {
         sock_num: Option<SockNum>,
     ) -> Result<DdpSocket, io::Error> {
         let sock_num = sock_num.unwrap_or_else(|| {
-            let mut rng = rand::thread_rng();
-            rng.gen_range(64..=255)
+            rand::rng().random_range(64..=255)
         });
 
         if self.sockets.contains_key(&sock_num) {

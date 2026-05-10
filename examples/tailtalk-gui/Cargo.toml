@@ -18,6 +18,7 @@ tailtalk = { workspace = true } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
 tracing = { workspace = true } #unified
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]

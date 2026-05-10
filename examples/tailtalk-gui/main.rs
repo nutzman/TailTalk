@@ -67,16 +67,43 @@ fn enumerate_serial() -> Vec<SerialDevice> {
     devices
 }
 
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+#[cfg(target_os = "macos")]
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let log_dir = std::env::var("HOME")
+        .map(|h| std::path::PathBuf::from(h).join("Library/Logs/TailTalk"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/TailTalk"));
+    std::fs::create_dir_all(&log_dir).ok();
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
+    let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer().with_writer(non_blocking))
+        .init();
+
+    Some(guard)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn init_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    tracing_subscriber::registry()
+        .with(LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    None
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
     // Commands flow from Slint callbacks → this channel → tokio server_loop
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
 
-    tracing_subscriber::registry()
-        .with(LevelFilter::INFO)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let _log_guard = init_logging();
 
     let ui = AppWindow::new()?;
 
