@@ -29,16 +29,40 @@ Packet parsers and fully async APIs for almost all the major AppleTalk protocols
 - AppleTalk Filing Protocol (AFP)
 - AppleTalk Data Stream Protocol (ADSP - untested) 
 
+It additionally supports running with TashTalk for LocalTalk Macs.
+
+## Building
+
+This project requires Rust 1.90 or above, which can be installed from [rustup.rs](rustup.rs). This should install
+a matching compiler for your OS and CPU architecture by default.
+
+Once installed, run `cargo build --release` from the root of this repository to build everything, or for just the
+TailTail GUI run `cargo build -p tailtalk-gui --release`.
+
+After building the binaries should be located at `target/release/`.
+
+This project uses [cargo-packager](github.com/crabnebula-dev/cargo-packager) for building AppImage for Linux and App bundles
+for macOS. Install it with `cargo install cargo-packager`, then run the following based on your OS:
+```sh
+# Linux
+cargo packager --release -f appimage -p tailtalk-gui
+# macOS
+cargo packager --release -p tailtalk-gui
+```
+
+The resulting bundle will be placed in dist/. 
+
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
 
 - [aep-echo](/examples/aep-echo/) - A simple echo program that sends an echo request to a target address and prints the response time.
 - [afp-server](/examples/afp-server) - An AFP 1.0, 1.1 and 2.0 compatible AFP server. Very much a work in progress but is capable of reading and writing files to classic Mac systems. Basic directory browsing and file operations are supported.
 - [nbp-lookup](/examples/nbp-lookup) - Performs an NBP lookup based on the provided request string and returns the results
-- [pap-print](/examples/pap-print) - Sends a PostScript file to a PAP printer. Aimed at LaserWriters, and have only tested on my own 4/600 PS. 
+- [pap-print](/examples/pap-print) - Sends a PostScript file to a PAP printer. Aimed at LaserWriters, and have only tested on my own 4/600 PS.
+- [tailtalk-gui](/examples/tailtalk-gui/) - A simple GUI for sharing a folder as a volume over EtherTalk and/or LocalTalk (via TashTalk).
 
-All of the examples run a complete copy of the stack using a raw socket and thus need to be run as root, or the appropriate setcap
-applied to the compiled binary. 
+All of the examples run a complete copy of the stack using a raw socket (if EtherTalk is enabled) and thus need to be run as root,
+ or the appropriate setcap applied to the compiled binary. If only using TashTalk then this is not required.
 
 ## Testing
 
