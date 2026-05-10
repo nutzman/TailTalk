@@ -3,7 +3,7 @@ import { Button, CheckBox, ComboBox, LineEdit, GroupBox, HorizontalBox, Vertical
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
     min-width: 400px;
-    min-height: 380px;
+    min-height: 200px;
     preferred-width: 540px;
     preferred-height: 440px;
 
@@ -17,6 +17,10 @@ export component AppWindow inherits Window {
     in-out property <bool> tashtalk-crc-checking: false;
     in-out property <bool> tashtalk-crc-generation: false;
     in property <bool> running: false;
+
+    // Set from Rust at startup to reflect compiled-in features
+    in property <bool> feature-ethertalk: false;
+    in property <bool> feature-tashtalk: false;
 
     callback start-stop();
     callback browse-volume();
@@ -41,7 +45,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalBox {
+                if root.feature-ethertalk : HorizontalBox {
                     Text { text: "Ethernet Interface:"; min-width: 140px; vertical-alignment: center; }
                     ComboBox {
                         model: root.ethernet-interfaces;
@@ -51,7 +55,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalBox {
+                if root.feature-tashtalk : HorizontalBox {
                     Text { text: "TashTalk Port:"; min-width: 140px; vertical-alignment: center; }
                     ComboBox {
                         model: root.tashtalk-ports;
@@ -61,7 +65,7 @@ export component AppWindow inherits Window {
                     }
                 }
 
-                HorizontalBox {
+                if root.feature-tashtalk : HorizontalBox {
                     Text { text: "TashTalk CRC:"; min-width: 140px; vertical-alignment: center; }
                     CheckBox {
                         text: "Generation";

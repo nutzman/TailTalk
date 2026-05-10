@@ -1,0 +1,413 @@
+use std::path::PathBuf;
+
+#[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
+use std::rc::Rc;
+
+#[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
+use slint::SharedString;
+use tracing_subscriber::{filter::LevelFilter, prelude::*};
+
+slint::include_modules!();
+
+// ── Commands sent from the UI thread to the tokio server task ─────────────────
+
+enum ServerCommand {
+    Start {
+        server_name: String,
+        volume_name: String,
+        #[cfg(feature = "ethertalk")]
+        ethernet: Option<String>,
+        #[cfg(feature = "tashtalk")]
+        tashtalk: Option<String>,
+        #[cfg(feature = "tashtalk")]
+        tashtalk_crc_generation: bool,
+        #[cfg(feature = "tashtalk")]
+        tashtalk_crc_checking: bool,
+        volume: PathBuf,
+    },
+    Stop,
+}
+
+// ── Interface enumeration ─────────────────────────────────────────────────────
+
+#[cfg(feature = "ethertalk")]
+fn enumerate_ethernet() -> Vec<String> {
+    let mut names = vec!["None".to_string()];
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        let mut seen = std::collections::HashSet::new();
+        for iface in ifaces {
+            if !iface.is_loopback() && seen.insert(iface.name.clone()) {
+                names.push(iface.name);
+            }
+        }
+    }
+    names
+}
+
+#[cfg(feature = "tashtalk")]
+const TASHTALK_USB_VID: u16 = 0x10c4;
+#[cfg(feature = "tashtalk")]
+const TASHTALK_USB_PID: u16 = 0xea60;
+
+#[cfg(feature = "tashtalk")]
+struct SerialDevice {
+    label: String,
+    path: String,
+}
+
+#[cfg(feature = "tashtalk")]
+fn enumerate_serial() -> Vec<SerialDevice> {
+    let mut devices = Vec::new();
+    if let Ok(available) = serialport::available_ports() {
+        for p in available {
+            #[cfg(target_os = "macos")]
+            if p.port_name.starts_with("/dev/tty.") {
+                continue;
+            }
+            if let serialport::SerialPortType::UsbPort(ref info) = p.port_type
+                && info.vid == TASHTALK_USB_VID
+                && info.pid == TASHTALK_USB_PID
+            {
+                let product = info.product.as_deref().unwrap_or("TashTalk USB");
+                devices.push(SerialDevice {
+                    label: format!("{} - {}", product, p.port_name),
+                    path: p.port_name,
+                });
+            }
+        }
+    }
+    devices
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+fn main() -> anyhow::Result<()> {
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
+
+    tracing_subscriber::registry()
+        .with(LevelFilter::INFO)
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let ui = AppWindow::new()?;
+
+    // Inform the UI which transport sections to show
+    ui.set_feature_ethertalk(cfg!(feature = "ethertalk"));
+    ui.set_feature_tashtalk(cfg!(feature = "tashtalk"));
+
+    #[cfg(feature = "ethertalk")]
+    let ethernet_names = enumerate_ethernet();
+    #[cfg(feature = "tashtalk")]
+    let tashtalk_devices = enumerate_serial();
+
+    #[cfg(feature = "ethertalk")]
+    {
+        let eth_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
+            ethernet_names
+                .iter()
+                .map(|s| SharedString::from(s.as_str()))
+                .collect::<Vec<_>>(),
+        ))
+        .into();
+        ui.set_ethernet_interfaces(eth_model);
+    }
+
+    #[cfg(feature = "tashtalk")]
+    {
+        let tash_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
+            std::iter::once(SharedString::from("None"))
+                .chain(
+                    tashtalk_devices
+                        .iter()
+                        .map(|d| SharedString::from(d.label.as_str())),
+                )
+                .collect::<Vec<_>>(),
+        ))
+        .into();
+        ui.set_tashtalk_ports(tash_model);
+    }
+
+    let ui_handle = ui.as_weak();
+    std::thread::spawn(move || {
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(server_loop(cmd_rx, ui_handle));
+    });
+
+    let ui_weak = ui.as_weak();
+    #[cfg(feature = "ethertalk")]
+    let eth_names = ethernet_names.clone();
+    #[cfg(feature = "tashtalk")]
+    let tash_devices = tashtalk_devices;
+
+    ui.on_start_stop(move || {
+        let Some(ui) = ui_weak.upgrade() else { return };
+
+        if ui.get_running() {
+            let _ = cmd_tx.try_send(ServerCommand::Stop);
+        } else {
+            #[cfg(feature = "ethertalk")]
+            let ethernet = {
+                let eth_idx = ui.get_selected_ethernet() as usize;
+                eth_names
+                    .get(eth_idx)
+                    .filter(|s| s.as_str() != "None")
+                    .cloned()
+            };
+
+            #[cfg(feature = "tashtalk")]
+            let tashtalk = {
+                let tash_idx = ui.get_selected_tashtalk() as usize;
+                // index 0 is "None"; devices start at 1
+                tash_idx
+                    .checked_sub(1)
+                    .and_then(|i| tash_devices.get(i))
+                    .map(|d| d.path.clone())
+            };
+
+            #[allow(unused_mut)]
+            let mut any_transport = false;
+            #[cfg(feature = "ethertalk")]
+            if ethernet.is_some() {
+                any_transport = true;
+            }
+            #[cfg(feature = "tashtalk")]
+            if tashtalk.is_some() {
+                any_transport = true;
+            }
+            if !any_transport {
+                tracing::error!("At least one transport must be selected");
+                return;
+            }
+
+            let volume = PathBuf::from(ui.get_volume_path().as_str());
+            if volume.as_os_str().is_empty() {
+                tracing::error!("No volume path selected");
+                return;
+            }
+
+            let _ = cmd_tx.try_send(ServerCommand::Start {
+                server_name: ui.get_server_name().to_string(),
+                volume_name: ui.get_volume_name().to_string(),
+                #[cfg(feature = "ethertalk")]
+                ethernet,
+                #[cfg(feature = "tashtalk")]
+                tashtalk,
+                #[cfg(feature = "tashtalk")]
+                tashtalk_crc_generation: ui.get_tashtalk_crc_generation(),
+                #[cfg(feature = "tashtalk")]
+                tashtalk_crc_checking: ui.get_tashtalk_crc_checking(),
+                volume,
+            });
+        }
+    });
+
+    let ui_weak = ui.as_weak();
+    ui.on_browse_volume(move || {
+        let Some(ui) = ui_weak.upgrade() else { return };
+        if let Some(path) = rfd::FileDialog::new().pick_folder() {
+            ui.set_volume_path(path.to_string_lossy().into_owned().into());
+        }
+    });
+
+    ui.run()?;
+    Ok(())
+}
+
+// ── Server loop (runs on the background tokio thread) ─────────────────────────
+
+async fn server_loop(
+    mut cmd_rx: tokio::sync::mpsc::Receiver<ServerCommand>,
+    ui_weak: slint::Weak<AppWindow>,
+) {
+    let mut abort_handle: Option<tokio::task::AbortHandle> = None;
+
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            ServerCommand::Start {
+                server_name,
+                volume_name,
+                #[cfg(feature = "ethertalk")]
+                ethernet,
+                #[cfg(feature = "tashtalk")]
+                tashtalk,
+                #[cfg(feature = "tashtalk")]
+                tashtalk_crc_generation,
+                #[cfg(feature = "tashtalk")]
+                tashtalk_crc_checking,
+                volume,
+            } => {
+                if let Some(h) = abort_handle.take() {
+                    h.abort();
+                }
+
+                let ui_w = ui_weak.clone();
+                let task = tokio::spawn(run_server(
+                    server_name,
+                    volume_name,
+                    #[cfg(feature = "ethertalk")]
+                    ethernet,
+                    #[cfg(feature = "tashtalk")]
+                    tashtalk,
+                    #[cfg(feature = "tashtalk")]
+                    tashtalk_crc_generation,
+                    #[cfg(feature = "tashtalk")]
+                    tashtalk_crc_checking,
+                    volume,
+                    ui_w,
+                ));
+                abort_handle = Some(task.abort_handle());
+
+                let ui_w = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_w.upgrade() {
+                        ui.set_running(true);
+                    }
+                })
+                .ok();
+            }
+
+            ServerCommand::Stop => {
+                if let Some(h) = abort_handle.take() {
+                    h.abort();
+                }
+                let ui_w = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_w.upgrade() {
+                        ui.set_running(false);
+                    }
+                })
+                .ok();
+            }
+        }
+    }
+}
+
+// ── AFP server task ───────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+async fn run_server(
+    server_name: String,
+    volume_name: String,
+    #[cfg(feature = "ethertalk")] ethernet: Option<String>,
+    #[cfg(feature = "tashtalk")] tashtalk: Option<String>,
+    #[cfg(feature = "tashtalk")] tashtalk_crc_generation: bool,
+    #[cfg(feature = "tashtalk")] tashtalk_crc_checking: bool,
+    volume: PathBuf,
+    ui_weak: slint::Weak<AppWindow>,
+) {
+    use tailtalk::{
+        TalkStack,
+        afp::{AfpServer, AfpServerConfig},
+    };
+
+    let set_stopped = |ui_weak: slint::Weak<AppWindow>| {
+        slint::invoke_from_event_loop(move || {
+            if let Some(ui) = ui_weak.upgrade() {
+                ui.set_running(false);
+            }
+        })
+        .ok();
+    };
+
+    #[allow(unused_mut)]
+    let mut stack_builder = TalkStack::builder();
+
+    #[cfg(feature = "ethertalk")]
+    if let Some(ref intf) = ethernet {
+        stack_builder = stack_builder.ethernet(intf);
+    }
+
+    #[cfg(feature = "tashtalk")]
+    if let Some(ref tty) = tashtalk {
+        let mut features = tailtalk::TashTalkFeatures::new();
+        if tashtalk_crc_generation {
+            features = features.with_crc_calculation();
+        }
+        if tashtalk_crc_checking {
+            features = features.with_crc_checking();
+        }
+        stack_builder = stack_builder.localtalk(tty).tashtalk_features(features);
+    }
+
+    let stack = match stack_builder.build().await {
+        Ok(s) => s,
+        Err(e) => {
+            let is_perm = e.chain().any(|cause| {
+                cause
+                    .downcast_ref::<std::io::Error>()
+                    .map(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    .unwrap_or(false)
+            });
+
+            if is_perm {
+                #[cfg(target_os = "linux")]
+                {
+                    if let Ok(exe) = std::env::current_exe() {
+                        tracing::warn!(
+                            "Permission denied — requesting CAP_NET_RAW via pkexec setcap..."
+                        );
+                        let result = tokio::process::Command::new("pkexec")
+                            .args(["setcap", "cap_net_raw+eip"])
+                            .arg(&exe)
+                            .status()
+                            .await;
+
+                        match result {
+                            Ok(s) if s.success() => {
+                                tracing::info!("Capability granted — relaunching...");
+                                std::process::Command::new(&exe).spawn().ok();
+                                std::process::exit(0);
+                            }
+                            _ => tracing::error!(
+                                "pkexec setcap failed. Run manually: sudo setcap cap_net_raw+eip {}",
+                                exe.display()
+                            ),
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                tracing::error!("Permission denied opening raw socket: {e}");
+            } else {
+                tracing::error!("Failed to build AppleTalk stack: {e}");
+            }
+
+            set_stopped(ui_weak);
+            return;
+        }
+    };
+
+    let afp_config = AfpServerConfig {
+        volume_path: volume,
+        volume_name,
+        server_name,
+        ..AfpServerConfig::default()
+    };
+
+    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to spawn AFP server: {e}");
+            set_stopped(ui_weak);
+            return;
+        }
+    };
+
+    #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
+    {
+        #[cfg(all(feature = "ethertalk", feature = "tashtalk"))]
+        let transport_desc = match (&ethernet, &tashtalk) {
+            (Some(eth), Some(tty)) => format!("{eth} + {tty}"),
+            (Some(eth), None) => eth.clone(),
+            (None, Some(tty)) => tty.clone(),
+            (None, None) => unreachable!(),
+        };
+        #[cfg(all(feature = "ethertalk", not(feature = "tashtalk")))]
+        let transport_desc = ethernet.as_deref().unwrap_or("(none)").to_string();
+        #[cfg(all(not(feature = "ethertalk"), feature = "tashtalk"))]
+        let transport_desc = tashtalk.as_deref().unwrap_or("(none)").to_string();
+        tracing::info!("AFP server running on {transport_desc}");
+    }
+
+    std::future::pending::<()>().await;
+}

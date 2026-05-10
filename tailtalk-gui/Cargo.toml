@@ -1,0 +1,48 @@
+[package]
+name = "tailtalk-gui"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "tailtalk-gui"
+path = "main.rs"
+
+[features]
+default = ["tashtalk"]
+tashtalk = ["dep:serialport"]
+ethertalk = ["dep:if-addrs"]
+
+[dependencies]
+anyhow = { workspace = true } #unified
+rfd = "0.15"
+slint = "1"
+tailtalk = { workspace = true } #unified
+tailtalk-packets = { workspace = true } #unified
+tokio = { workspace = true, features = ["io-util"] } #unified
+tracing = { workspace = true } #unified
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+if-addrs = { version = "0.13", optional = true }
+serialport = { version = "4", optional = true }
+
+[build-dependencies]
+slint-build = "1"
+
+[package.metadata.packager]
+product_name = "TailTalk"
+identifier = "com.tailtalk.app"
+formats = ["app", "dmg", "appimage"]
+out_dir = "../dist"
+icons = ["../Happy_Mac.png"]
+
+[[package.metadata.packager.binaries]]
+path = "tailtalk-gui"
+main = true
+
+[package.metadata.packager.macos]
+minimum_system_version = "11.0"
+
+[package.metadata.packager.dmg]
+window_size = { width = 540, height = 380 }
+app_position = { x = 130, y = 220 }
+application_folder_position = { x = 410, y = 220 }
