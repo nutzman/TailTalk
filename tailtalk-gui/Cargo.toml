@@ -33,7 +33,7 @@ product_name = "TailTalk"
 identifier = "com.tailtalk.app"
 formats = ["app", "dmg", "appimage"]
 out_dir = "../dist"
-icons = ["../Happy_Mac.png"]
+icons = ["../icon.png"]
 
 [[package.metadata.packager.binaries]]
 path = "tailtalk-gui"
