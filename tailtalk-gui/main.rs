@@ -5,6 +5,8 @@ use std::rc::Rc;
 
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use slint::SharedString;
+use tailtalk::ShutdownHandle;
+use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
 slint::include_modules!();
@@ -79,15 +81,47 @@ fn enumerate_serial() -> Vec<SerialDevice> {
     devices
 }
 
+// ── Logging ───────────────────────────────────────────────────────────────────
+
+/// Set up tracing to write to both stdout and a rolling daily log file.
+/// Returns a guard that must be kept alive for the duration of the process;
+/// dropping it flushes and closes the file writer.
+fn init_logging() -> Option<WorkerGuard> {
+    #[cfg(target_os = "macos")]
+    {
+        let log_dir = dirs::home_dir()
+            .map(|h| h.join("Library/Logs/TailTalk"))
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp/TailTalk"));
+        let _ = std::fs::create_dir_all(&log_dir);
+
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "tailtalk.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+
+        tracing_subscriber::registry()
+            .with(LevelFilter::INFO)
+            .with(tracing_subscriber::fmt::layer()) // stdout
+            .with(tracing_subscriber::fmt::layer().with_writer(non_blocking)) // file
+            .init();
+
+        return Some(guard);
+    }
+
+    #[allow(unreachable_code)]
+    {
+        tracing_subscriber::registry()
+            .with(LevelFilter::INFO)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+        None
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() -> anyhow::Result<()> {
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<ServerCommand>(4);
 
-    tracing_subscriber::registry()
-        .with(LevelFilter::INFO)
-        .with(tracing_subscriber::fmt::layer())
-        .init();
+    let _log_guard = init_logging();
 
     let ui = AppWindow::new()?;
 
@@ -220,7 +254,7 @@ async fn server_loop(
     mut cmd_rx: tokio::sync::mpsc::Receiver<ServerCommand>,
     ui_weak: slint::Weak<AppWindow>,
 ) {
-    let mut abort_handle: Option<tokio::task::AbortHandle> = None;
+    let mut shutdown_handle: Option<ShutdownHandle> = None;
 
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
@@ -237,12 +271,13 @@ async fn server_loop(
                 tashtalk_crc_checking,
                 volume,
             } => {
-                if let Some(h) = abort_handle.take() {
-                    h.abort();
+                if let Some(h) = shutdown_handle.take() {
+                    h.shutdown();
                 }
 
                 let ui_w = ui_weak.clone();
-                let task = tokio::spawn(run_server(
+                let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<ShutdownHandle>();
+                tokio::spawn(run_server(
                     server_name,
                     volume_name,
                     #[cfg(feature = "ethertalk")]
@@ -254,22 +289,28 @@ async fn server_loop(
                     #[cfg(feature = "tashtalk")]
                     tashtalk_crc_checking,
                     volume,
-                    ui_w,
+                    ready_tx,
+                    ui_w.clone(),
                 ));
-                abort_handle = Some(task.abort_handle());
 
-                let ui_w = ui_weak.clone();
-                slint::invoke_from_event_loop(move || {
-                    if let Some(ui) = ui_w.upgrade() {
-                        ui.set_running(true);
-                    }
-                })
-                .ok();
+                // Wait for the stack to finish initialising (AARP probe etc.)
+                // before flipping the UI to "Running".
+                if let Ok(handle) = ready_rx.await {
+                    shutdown_handle = Some(handle);
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_w.upgrade() {
+                            ui.set_running(true);
+                        }
+                    })
+                    .ok();
+                }
+                // If ready_rx errors the stack failed to build; run_server
+                // already logged the error and reset the UI.
             }
 
             ServerCommand::Stop => {
-                if let Some(h) = abort_handle.take() {
-                    h.abort();
+                if let Some(h) = shutdown_handle.take() {
+                    h.shutdown();
                 }
                 let ui_w = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
@@ -283,6 +324,17 @@ async fn server_loop(
     }
 }
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+fn show_error(ui_weak: slint::Weak<AppWindow>, message: String) {
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_error_message(message.into());
+        }
+    })
+    .ok();
+}
+
 // ── AFP server task ───────────────────────────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
@@ -294,6 +346,7 @@ async fn run_server(
     #[cfg(feature = "tashtalk")] tashtalk_crc_generation: bool,
     #[cfg(feature = "tashtalk")] tashtalk_crc_checking: bool,
     volume: PathBuf,
+    ready_tx: tokio::sync::oneshot::Sender<ShutdownHandle>,
     ui_weak: slint::Weak<AppWindow>,
 ) {
     use tailtalk::{
@@ -359,17 +412,27 @@ async fn run_server(
                                 std::process::Command::new(&exe).spawn().ok();
                                 std::process::exit(0);
                             }
-                            _ => tracing::error!(
-                                "pkexec setcap failed. Run manually: sudo setcap cap_net_raw+eip {}",
-                                exe.display()
-                            ),
+                            _ => {
+                                let msg = format!(
+                                    "Permission denied. Run manually:\nsudo setcap cap_net_raw+eip {}",
+                                    exe.display()
+                                );
+                                tracing::error!("{msg}");
+                                show_error(ui_weak.clone(), msg);
+                            }
                         }
                     }
                 }
                 #[cfg(not(target_os = "linux"))]
-                tracing::error!("Permission denied opening raw socket: {e}");
+                {
+                    let msg = format!("Permission denied: {e}");
+                    tracing::error!("{msg}");
+                    show_error(ui_weak.clone(), msg);
+                }
             } else {
-                tracing::error!("Failed to build AppleTalk stack: {e}");
+                let msg = format!("Failed to start AppleTalk stack:\n{e}");
+                tracing::error!("{msg}");
+                show_error(ui_weak.clone(), msg);
             }
 
             set_stopped(ui_weak);
@@ -384,10 +447,12 @@ async fn run_server(
         ..AfpServerConfig::default()
     };
 
-    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config).await {
+    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token()).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::error!("Failed to spawn AFP server: {e}");
+            let msg = format!("Failed to start AFP server:\n{e}");
+            tracing::error!("{msg}");
+            show_error(ui_weak.clone(), msg);
             set_stopped(ui_weak);
             return;
         }
@@ -409,5 +474,11 @@ async fn run_server(
         tracing::info!("AFP server running on {transport_desc}");
     }
 
-    std::future::pending::<()>().await;
+    // Signal the GUI that the stack is up; hand over the shutdown handle.
+    let _ = ready_tx.send(stack.shutdown_handle());
+
+    // Block until shutdown() is called (e.g. the user clicks Stop).
+    stack.wait_for_shutdown().await;
+
+    set_stopped(ui_weak);
 }

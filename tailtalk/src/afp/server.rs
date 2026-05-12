@@ -2,6 +2,7 @@ use crate::afp::Volume;
 use crate::asp::{Asp, AspCommandResponse, AspHandle, AspSession};
 use crate::ddp::DdpHandle;
 use crate::nbp::NbpHandle;
+use crate::CancellationToken;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tailtalk_packets::afp::{
@@ -70,12 +71,16 @@ pub struct AfpServer {
 }
 
 impl AfpServer {
-    /// Spawn a new AFP server
+    /// Spawn a new AFP server.
+    ///
+    /// `shutdown` should be the token from [`TalkStack::token()`](crate::TalkStack::token)
+    /// so the server stops when the stack shuts down.
     pub async fn spawn(
         ddp: &DdpHandle,
         nbp: &NbpHandle,
         socket: Option<u8>,
         config: AfpServerConfig,
+        shutdown: CancellationToken,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(config);
 
@@ -111,7 +116,7 @@ impl AfpServer {
         let server_clone_config = server.config.clone();
         let server_clone_handle = server.asp_handle.clone();
         tokio::spawn(async move {
-            run_server(server_clone_handle, server_clone_config).await;
+            run_server(server_clone_handle, server_clone_config, shutdown).await;
         });
 
         Ok(server)
@@ -119,7 +124,7 @@ impl AfpServer {
 }
 
 /// Run the AFP server session loop
-async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>) {
+async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: CancellationToken) {
     info!(
         "AFP server '{}' waiting for sessions...",
         config.server_name
@@ -128,27 +133,26 @@ async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>) {
     let mut session_count = 0;
 
     loop {
-        match asp_handle.get_session().await {
-            Ok(session) => {
-                session_count += 1;
-                info!(
-                    "AFP session {} accepted from {:?}",
-                    session_count, session.remote_addr
-                );
+        let session = tokio::select! {
+            _ = token.cancelled() => break,
+            result = asp_handle.get_session() => match result {
+                Ok(s) => s,
+                Err(e) => { error!("Failed to accept AFP session: {}", e); break; }
+            },
+        };
 
-                // Spawn handler for this session
-                let session_config = config.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = session.handle_session(session_config).await {
-                        error!("Session error: {}", e);
-                    }
-                });
+        session_count += 1;
+        info!(
+            "AFP session {} accepted from {:?}",
+            session_count, session.remote_addr
+        );
+
+        let session_config = config.clone();
+        tokio::spawn(async move {
+            if let Err(e) = session.handle_session(session_config).await {
+                error!("Session error: {}", e);
             }
-            Err(e) => {
-                error!("Failed to accept AFP session: {}", e);
-                break;
-            }
-        }
+        });
     }
 }
 
@@ -284,7 +288,7 @@ impl AspSession {
                     self.handle_read(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_FILE_DIR_PARMS => {
-                    self.handle_get_file_dir_parms(command, &our_volume).await?;
+                    self.handle_get_file_dir_parms(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_SET_FILE_DIR_PARMS => {
                     self.handle_set_file_dir_parms(command, &mut our_volume)
@@ -609,7 +613,7 @@ impl AspSession {
     async fn handle_get_file_dir_parms(
         &self,
         command: crate::asp::AspCommand,
-        our_volume: &Volume,
+        our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let cmd = FPGetFileDirParms::parse(&command.data[2..]).unwrap();
         let file_bitmap = cmd.file_bitmap;
@@ -626,7 +630,7 @@ impl AspSession {
             return Ok(());
         }
 
-        let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
+        let node_id = match our_volume.resolve_node_lazy(cmd.directory_id, &path_name_buf).await {
             Ok(node_id) => node_id,
             Err(e) => {
                 debug!(
@@ -698,7 +702,7 @@ impl AspSession {
             return Ok(());
         }
 
-        let node_id = match our_volume.resolve_node(cmd.directory_id, &path_name_buf) {
+        let node_id = match our_volume.resolve_node_lazy(cmd.directory_id, &path_name_buf).await {
             Ok(node_id) => node_id,
             Err(e) => {
                 debug!("AFP FPSetFileDirParms resp: err={:?}", e);
@@ -843,7 +847,7 @@ impl AspSession {
             dir_cmd.directory_id, path_name_buf, dir_cmd.dir_bitmap
         );
 
-        let node_id = match our_volume.resolve_node(dir_cmd.directory_id, &path_name_buf) {
+        let node_id = match our_volume.resolve_node_lazy(dir_cmd.directory_id, &path_name_buf).await {
             Ok(node_id) => node_id,
             Err(e) => {
                 debug!("AFP FPSetDirParms resp: err={:?}", e);

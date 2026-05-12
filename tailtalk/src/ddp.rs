@@ -304,7 +304,8 @@ impl DdpProcessor {
 
         tracing::debug!("DDP: Sending packet with headers {:?}", headers);
 
-        self.ethertalk
+        if let Err(e) = self
+            .ethertalk
             .send(DataLinkPacket {
                 dest_node,
                 protocol: DataLinkProtocol::Ddp,
@@ -312,7 +313,9 @@ impl DdpProcessor {
                 src_node_id: our_addr.node_number,
             })
             .await
-            .expect("failed to send");
+        {
+            tracing::debug!("DDP: send dropped (stack shutting down): {e}");
+        }
     }
 }
 

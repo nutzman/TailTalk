@@ -9,6 +9,7 @@ use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 use futures::StreamExt;
+pub use tokio_util::sync::CancellationToken;
 
 pub use tashtalk::TashTalkFeatures;
 
@@ -181,7 +182,7 @@ impl PacketProcessorBuilder {
             let stream = tokio_serial::new(&path, 1_000_000)
                 .flow_control(tokio_serial::FlowControl::Hardware)
                 .open_native_async()
-                .expect("Failed to open serial port for TashTalk");
+                .map_err(|e| anyhow::anyhow!("Failed to open TashTalk serial port '{}': {e}", path))?;
             Some(TashTalk::new(stream))
         } else {
             None
@@ -216,11 +217,12 @@ impl PacketProcessor {
         self.our_mac
     }
 
-    pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle) {
+    pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle, token: CancellationToken) {
         // ── EtherTalk RX task ────────────────────────────────────────────────
         if let Some(rx_cap) = self.pcap_rx {
             let ddp_rx = ddp.clone();
             let addressing_rx = addressing.clone();
+            let rx_token = token.clone();
 
             let rx_cap = match rx_cap.setnonblock() {
                 Ok(c) => c,
@@ -240,13 +242,14 @@ impl PacketProcessor {
             tokio::spawn(async move {
                 tracing::info!("EtherTalk RX task started");
                 tokio::pin!(stream);
-                while let Some(result) = stream.next().await {
-                    let data: Box<[u8]> = match result {
-                        Ok(d) => d,
-                        Err(e) => {
-                            tracing::error!("pcap rx error: {e}");
-                            break;
-                        }
+                loop {
+                    let data: Box<[u8]> = tokio::select! {
+                        _ = rx_token.cancelled() => break,
+                        result = stream.next() => match result {
+                            Some(Ok(d)) => d,
+                            Some(Err(e)) => { tracing::error!("pcap rx error: {e}"); break; }
+                            None => break,
+                        },
                     };
 
                     let ethertype_or_len = u16::from_be_bytes([data[12], data[13]]);
@@ -347,6 +350,7 @@ impl PacketProcessor {
 
             let ddp_handle = ddp.clone();
             let addressing_handle = addressing.clone();
+            let tash_token = token.clone();
 
             tokio::spawn(async move {
                 tracing::info!("Resetting TashTalk buffers...");
@@ -385,6 +389,7 @@ impl PacketProcessor {
                 tracing::info!("Starting TashTalk async loop");
                 loop {
                     tokio::select! {
+                        _ = tash_token.cancelled() => break,
                         frame_opt = tashtalk_rx.recv() => {
                             if let Some(frame) = frame_opt {
                                 if let Err(e) = tashtalk_instance.send_frame(&frame).await {
@@ -460,7 +465,11 @@ impl PacketProcessor {
         let mut rx = self.outbound_rx;
         let mut pcap_tx = self.pcap_tx;
 
-        while let Some(pkt) = rx.recv().await {
+        loop {
+            let pkt = tokio::select! {
+                _ = token.cancelled() => break,
+                pkt = rx.recv() => match pkt { Some(p) => p, None => break },
+            };
             let mut output_buf: [u8; 1500] = [0u8; 1500];
 
             let final_size = match pkt.protocol {
@@ -600,6 +609,18 @@ impl OutboundHandle {
 
 // ── TalkStack ─────────────────────────────────────────────────────────────────
 
+/// A lightweight handle that can be used to shut down a running [`TalkStack`]
+/// from another task without holding the full stack.
+#[derive(Clone)]
+pub struct ShutdownHandle(CancellationToken);
+
+impl ShutdownHandle {
+    /// Signal the stack to shut down all actors.
+    pub fn shutdown(&self) {
+        self.0.cancel();
+    }
+}
+
 /// Handles to all mandatory AppleTalk stack layers.
 ///
 /// Obtain one via [`TalkStack::builder`]. Once built, spawn services on top:
@@ -612,7 +633,7 @@ impl OutboundHandle {
 ///     .build()
 ///     .await?;
 ///
-/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default()).await?;
+/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default(), stack.token()).await?;
 /// # Ok(()) }
 /// ```
 pub struct TalkStack {
@@ -620,6 +641,31 @@ pub struct TalkStack {
     pub ddp: ddp::DdpHandle,
     pub nbp: nbp::NbpHandle,
     pub echo: echo::EchoHandle,
+    token: CancellationToken,
+}
+
+impl TalkStack {
+    /// Signal all stack actors to stop.
+    pub fn shutdown(&self) {
+        self.token.cancel();
+    }
+
+    /// Wait until [`shutdown`](Self::shutdown) has been called.
+    pub async fn wait_for_shutdown(&self) {
+        self.token.cancelled().await;
+    }
+
+    /// Return a [`ShutdownHandle`] that can be sent to another task to
+    /// trigger shutdown remotely.
+    pub fn shutdown_handle(&self) -> ShutdownHandle {
+        ShutdownHandle(self.token.clone())
+    }
+
+    /// Return a clone of the stack's cancellation token, suitable for passing
+    /// to sub-services such as [`AfpServer::spawn`](afp::AfpServer::spawn).
+    pub fn token(&self) -> CancellationToken {
+        self.token.clone()
+    }
 }
 
 /// Builder for [`TalkStack`].
@@ -689,14 +735,15 @@ impl TalkStackBuilder {
         let echo = echo::Echo::spawn(&ddp).await;
         let nbp = nbp::Nbp::spawn(&ddp, addressing.clone()).await;
 
-        tokio::spawn(processor.run(addressing.clone(), ddp.clone()));
+        let token = CancellationToken::new();
+        tokio::spawn(processor.run(addressing.clone(), ddp.clone(), token.clone()));
 
         // Wait until AARP has confirmed our node address before returning.
         // Without this, callers could attempt to send packets before addressing
         // is ready, especially when probing is required (no fixed address).
         addressing.addr().await?;
 
-        Ok(TalkStack { addressing, ddp, nbp, echo })
+        Ok(TalkStack { addressing, ddp, nbp, echo, token })
     }
 }
 

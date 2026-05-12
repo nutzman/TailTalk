@@ -299,7 +299,6 @@ impl Volume {
         // Ensure .tailtalk exists so the root offspring count is never zero at mount time.
         let _ = tokio::fs::create_dir_all(new_self.path.join(".tailtalk")).await;
 
-        new_self.walk_dir(PathBuf::new()).await.unwrap();
         new_self
     }
 
@@ -647,6 +646,69 @@ impl Volume {
         Ok(())
     }
 
+    /// Populate just the immediate children of `dir_id` from the filesystem.
+    /// Nodes that are already registered are skipped. Subdirectory contents are
+    /// not walked — they will be populated on demand when the client drills in.
+    pub async fn ensure_dir_populated(&mut self, dir_id: u32) -> std::io::Result<()> {
+        let dir_path = {
+            let node = self.nodes.get(&dir_id).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::NotFound, "dir not found")
+            })?;
+            node.path.clone()
+        };
+
+        let full_path = self.path.join(&dir_path);
+        let mut read_dir = tokio::fs::read_dir(&full_path).await?;
+
+        while let Some(entry) = read_dir.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == ".tailtalk" {
+                continue;
+            }
+            let rel_path = dir_path.join(&name);
+            if self.path_to_id.contains_key(&rel_path) {
+                continue;
+            }
+            let is_dir = entry.file_type().await?.is_dir();
+            let new_id = self.next_id;
+            self.next_id += 1;
+            self.nodes.insert(
+                new_id,
+                Node {
+                    id: new_id,
+                    parent_id: dir_id,
+                    name,
+                    is_dir,
+                    path: rel_path.clone(),
+                    data_fork: None,
+                    resource_fork: None,
+                },
+            );
+            self.path_to_id.insert(rel_path, new_id);
+        }
+
+        Ok(())
+    }
+
+    /// Like `resolve_node` but will populate an un-walked directory on cache miss
+    /// before retrying, so clients can navigate into directories that haven't been
+    /// enumerated yet without getting a spurious ObjectNotFound.
+    pub async fn resolve_node_lazy(
+        &mut self,
+        directory_id: u32,
+        path_name: &Path,
+    ) -> Result<u32, AfpError> {
+        if let Ok(id) = self.resolve_node(directory_id, path_name) {
+            return Ok(id);
+        }
+        let dir_id = if directory_id == 0 { 2 } else { directory_id };
+        // Only populate real nodes (ID 1 is the synthetic parent-of-root).
+        if dir_id >= 2 && !afp_path_is_empty(path_name) {
+            let _ = self.ensure_dir_populated(dir_id).await;
+        }
+        self.resolve_node(directory_id, path_name)
+    }
+
     /// Get volume parameters for FPGetVolParms
     /// Returns the attributes flags for AFP. Currently only bit 0 is relevant, which signifies if
     /// this volume is read-only or not.
@@ -929,6 +991,10 @@ impl Volume {
         output: &mut [u8],
     ) -> Result<usize, AfpError> {
         let mut offset = 0;
+
+        // Populate the parent directory on first access so callers don't need
+        // to enumerate before opening a file they already know exists.
+        let _ = self.ensure_dir_populated(dir_id).await;
 
         match fork_type {
             ForkType::Data => {
@@ -1640,7 +1706,9 @@ impl Volume {
     }
 
     pub async fn delete(&mut self, delete_req: &FPDelete) -> Result<(), AfpError> {
-        let node_id = self.resolve_node(delete_req.directory_id, Path::new(&delete_req.path))?;
+        let node_id = self
+            .resolve_node_lazy(delete_req.directory_id, Path::new(&delete_req.path))
+            .await?;
 
         // Cannot delete root
         if node_id == 2 {
@@ -1974,7 +2042,7 @@ mod tests {
         volume.close_fork(fork_ref).await.unwrap();
 
         // Open fork for file in subdirectory (dir_id = subdir node)
-        let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
+        let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
         let result = volume
             .open_fork(
                 ForkType::Data,
@@ -2048,7 +2116,7 @@ mod tests {
         assert_eq!(sidecar_contents, payload);
 
         // RESOURCE_FORK_LENGTH should now reflect the written size
-        let node_id = volume.resolve_node(2, Path::new("rsrc_test.txt")).unwrap();
+        let node_id = volume.resolve_node_lazy(2, Path::new("rsrc_test.txt")).await.unwrap();
         let mut parms_output = [0u8; 64];
         let (_, bytes_written) = volume
             .get_node_parms(
@@ -2064,7 +2132,7 @@ mod tests {
         assert_eq!(reported_len as usize, payload.len());
 
         // --- File in subdirectory ---
-        let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
+        let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
         let result = volume
             .open_fork(
                 ForkType::Resource,
@@ -2133,10 +2201,10 @@ mod tests {
             .await
             .unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
 
         // Resolve subdir from root
-        let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
+        let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
         assert!(subdir_id >= 3, "subdir should have a real node ID");
 
         // Identity lookup on the subdir itself
@@ -2163,7 +2231,7 @@ mod tests {
         File::create(subdir.join("c.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
-        let subdir_id = volume.resolve_node(2, Path::new("subdir")).unwrap();
+        let subdir_id = volume.resolve_node_lazy(2, Path::new("subdir")).await.unwrap();
 
         let enumerate_cmd = FPEnumerate {
             volume_id: 1,
@@ -2211,7 +2279,7 @@ mod tests {
             .unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
-        let node_id = volume.resolve_node(2, Path::new("mydir")).unwrap();
+        let node_id = volume.resolve_node_lazy(2, Path::new("mydir")).await.unwrap();
 
         // Build a recognisable 32-byte Finder Info payload
         let mut finder_info = [0u8; 32];
@@ -2299,8 +2367,8 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("test.txt")).await.unwrap();
 
-        let volume = Volume::new("TestVol".to_string(), root_path, 1).await;
-        let node_id = volume.resolve_node(2, Path::new("test.txt")).unwrap();
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+        let node_id = volume.resolve_node_lazy(2, Path::new("test.txt")).await.unwrap();
 
         let mut output = [0u8; 64];
         let (is_dir, bytes_written) = volume
@@ -2326,7 +2394,7 @@ mod tests {
         File::create(root_path.join("test.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
-        let node_id = volume.resolve_node(2, Path::new("test.txt")).unwrap();
+        let node_id = volume.resolve_node_lazy(2, Path::new("test.txt")).await.unwrap();
 
         let mut finder_info = [0u8; 32];
         finder_info[0..4].copy_from_slice(b"TEXT");

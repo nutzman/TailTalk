@@ -273,8 +273,13 @@ impl Atp {
                         Ok(mut pkt) => {
                             self.handle_packet(pkt.headers, &mut pkt.payload).await;
                         },
+                        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                            tracing::debug!("ATP socket closed, shutting down");
+                            break;
+                        },
                         Err(e) => {
                             tracing::error!("ATP socket error: {}", e);
+                            break;
                         },
                     }
                 },

@@ -21,6 +21,7 @@ export component AppWindow inherits Window {
     // Set from Rust at startup to reflect compiled-in features
     in property <bool> feature-ethertalk: false;
     in property <bool> feature-tashtalk: false;
+    in-out property <string> error-message: "";
 
     callback start-stop();
     callback browse-volume();
@@ -126,6 +127,50 @@ export component AppWindow inherits Window {
             Button {
                 text: root.running ? "Stop" : "Start";
                 clicked => { root.start-stop(); }
+            }
+        }
+    }
+
+    // Error dialog — rendered on top of all content when error-message is set
+    if root.error-message != "" : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(0, 0, 0, 0.45);
+
+        Rectangle {
+            width: 360px;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #f5f5f5;
+            border-radius: 8px;
+            drop-shadow-blur: 20px;
+            drop-shadow-color: rgba(0, 0, 0, 0.35);
+
+            VerticalBox {
+                padding: 20px;
+                spacing: 14px;
+
+                Text {
+                    text: "Error";
+                    font-size: 15px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: root.error-message;
+                    wrap: word-wrap;
+                    horizontal-alignment: center;
+                }
+
+                HorizontalBox {
+                    alignment: center;
+                    Button {
+                        text: "OK";
+                        clicked => { root.error-message = ""; }
+                    }
+                }
             }
         }
     }

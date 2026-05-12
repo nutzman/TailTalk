@@ -52,6 +52,17 @@ cargo packager --release -p tailtalk-gui
 
 The resulting bundle will be placed in dist/. 
 
+## TashTalk USB
+
+This project supports using the TashTalk USB (and regular TashTalk) for communicating
+over LocalTalk. For Linux users, you typically need to be in the "dialout" group
+to have the right permissions to open the serial device as your regular user:
+```bash
+sudo gpasswd -a $USER dialout
+```
+
+A log out and back in again is usually required for this to take effect.
+
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
 

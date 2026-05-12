@@ -22,6 +22,8 @@ tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
 tracing = { workspace = true } #unified
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+dirs = "5"
 if-addrs = { version = "0.13", optional = true }
 serialport = { version = "4", optional = true }
 

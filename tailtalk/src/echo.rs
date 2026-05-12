@@ -52,18 +52,15 @@ impl Echo {
         loop {
             tokio::select! {
                 try_req = self.request_rx.recv() => {
-                    if let Some(req) = try_req {
-                        self.send_echo(req).await.expect("failed to send echo request");
+                    match try_req {
+                        Some(req) => self.send_echo(req).await.expect("failed to send echo request"),
+                        None => break,
                     }
                 }
                 sock_recv = self.sock.recv() => {
                     match sock_recv {
-                        Ok(mut pkt) => {
-                            self.handle_packet(pkt.headers, &mut pkt.payload).await;
-                        },
-                        Err(_e) => {
-
-                        },
+                        Ok(mut pkt) => self.handle_packet(pkt.headers, &mut pkt.payload).await,
+                        Err(_) => break,
                     }
                 }
             }
