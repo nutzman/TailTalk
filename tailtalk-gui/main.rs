@@ -230,10 +230,18 @@ fn main() -> anyhow::Result<()> {
 
     let ui_weak = ui.as_weak();
     ui.on_browse_volume(move || {
-        let Some(ui) = ui_weak.upgrade() else { return };
-        if let Some(path) = rfd::FileDialog::new().pick_folder() {
-            ui.set_volume_path(path.to_string_lossy().into_owned().into());
-        }
+        let ui_weak = ui_weak.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                let path_str: slint::SharedString = path.to_string_lossy().into_owned().into();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_volume_path(path_str);
+                    }
+                })
+                .ok();
+            }
+        });
     });
 
     ui.run()?;
