@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
@@ -14,8 +14,6 @@ export component AppWindow inherits Window {
     in-out property <int> selected-tashtalk: 0;
     in-out property <string> volume-path;
     in-out property <string> volume-name: "MacShare";
-    in-out property <bool> tashtalk-crc-checking: false;
-    in-out property <bool> tashtalk-crc-generation: false;
     in property <bool> running: false;
 
     // Set from Rust at startup to reflect compiled-in features
@@ -62,20 +60,6 @@ export component AppWindow inherits Window {
                         model: root.tashtalk-ports;
                         current-index <=> root.selected-tashtalk;
                         horizontal-stretch: 1;
-                        enabled: !root.running;
-                    }
-                }
-
-                if root.feature-tashtalk : HorizontalBox {
-                    Text { text: "TashTalk CRC:"; min-width: 140px; vertical-alignment: center; }
-                    CheckBox {
-                        text: "Generation";
-                        checked <=> root.tashtalk-crc-generation;
-                        enabled: !root.running;
-                    }
-                    CheckBox {
-                        text: "Checking";
-                        checked <=> root.tashtalk-crc-checking;
                         enabled: !root.running;
                     }
                 }

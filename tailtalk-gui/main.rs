@@ -21,10 +21,6 @@ enum ServerCommand {
         ethernet: Option<String>,
         #[cfg(feature = "tashtalk")]
         tashtalk: Option<String>,
-        #[cfg(feature = "tashtalk")]
-        tashtalk_crc_generation: bool,
-        #[cfg(feature = "tashtalk")]
-        tashtalk_crc_checking: bool,
         volume: PathBuf,
     },
     Stop,
@@ -227,10 +223,6 @@ fn main() -> anyhow::Result<()> {
                 ethernet,
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
-                #[cfg(feature = "tashtalk")]
-                tashtalk_crc_generation: ui.get_tashtalk_crc_generation(),
-                #[cfg(feature = "tashtalk")]
-                tashtalk_crc_checking: ui.get_tashtalk_crc_checking(),
                 volume,
             });
         }
@@ -265,10 +257,6 @@ async fn server_loop(
                 ethernet,
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
-                #[cfg(feature = "tashtalk")]
-                tashtalk_crc_generation,
-                #[cfg(feature = "tashtalk")]
-                tashtalk_crc_checking,
                 volume,
             } => {
                 if let Some(h) = shutdown_handle.take() {
@@ -284,10 +272,6 @@ async fn server_loop(
                     ethernet,
                     #[cfg(feature = "tashtalk")]
                     tashtalk,
-                    #[cfg(feature = "tashtalk")]
-                    tashtalk_crc_generation,
-                    #[cfg(feature = "tashtalk")]
-                    tashtalk_crc_checking,
                     volume,
                     ready_tx,
                     ui_w.clone(),
@@ -343,8 +327,6 @@ async fn run_server(
     volume_name: String,
     #[cfg(feature = "ethertalk")] ethernet: Option<String>,
     #[cfg(feature = "tashtalk")] tashtalk: Option<String>,
-    #[cfg(feature = "tashtalk")] tashtalk_crc_generation: bool,
-    #[cfg(feature = "tashtalk")] tashtalk_crc_checking: bool,
     volume: PathBuf,
     ready_tx: tokio::sync::oneshot::Sender<ShutdownHandle>,
     ui_weak: slint::Weak<AppWindow>,
@@ -373,13 +355,9 @@ async fn run_server(
 
     #[cfg(feature = "tashtalk")]
     if let Some(ref tty) = tashtalk {
-        let mut features = tailtalk::TashTalkFeatures::new();
-        if tashtalk_crc_generation {
-            features = features.with_crc_calculation();
-        }
-        if tashtalk_crc_checking {
-            features = features.with_crc_checking();
-        }
+        let features = tailtalk::TashTalkFeatures::new()
+            .with_crc_calculation()
+            .with_crc_checking();
         stack_builder = stack_builder.localtalk(tty).tashtalk_features(features);
     }
 
