@@ -1172,7 +1172,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let enumerate = FPEnumerate::parse(&command.data[2..]).unwrap();
+        let mut enumerate = FPEnumerate::parse(&command.data[2..]).unwrap();
         debug!(
             "AFP FPEnumerate req: dir_id={}, path={:?}, start={}, req_count={}, max_reply={}",
             enumerate.directory_id,
@@ -1186,16 +1186,21 @@ impl AspSession {
         output_buf[..2].copy_from_slice(&enumerate.file_bitmap.bits().to_be_bytes());
         output_buf[2..4].copy_from_slice(&enumerate.directory_bitmap.bits().to_be_bytes());
 
-        let start_offset = 4;
+        let start_offset = 4u16;
+        // The bitmap header we prepend eats into the ATP payload, so shrink the
+        // effective limit so the enumerate payload + header never exceeds what the
+        // client declared it can receive.
+        enumerate.max_reply_size = enumerate.max_reply_size.saturating_sub(start_offset);
 
         match our_volume
-            .enumerate(enumerate, &mut output_buf[start_offset..])
+            .enumerate(enumerate, &mut output_buf[start_offset as usize..])
             .await
         {
             Ok(offset) => {
                 // Entry count is the first 2 bytes of the enumerate result
+                let so = start_offset as usize;
                 let count =
-                    u16::from_be_bytes([output_buf[start_offset], output_buf[start_offset + 1]]);
+                    u16::from_be_bytes([output_buf[so], output_buf[so + 1]]);
                 // AFP spec: when no entries are returned, signal end-of-directory with
                 // ObjectNotFound but still include the bitmap/count data so the client
                 // can distinguish this from a hard error.
@@ -1207,11 +1212,11 @@ impl AspSession {
                 debug!(
                     "AFP FPEnumerate resp: count={}, {} total bytes",
                     count,
-                    offset + start_offset
+                    offset + so
                 );
                 Ok(command.send_reply(AspCommandResponse {
                     result,
-                    data: output_buf[..offset + start_offset].to_vec(),
+                    data: output_buf[..offset + so].to_vec(),
                 })?)
             }
             Err(e) => {

@@ -1412,6 +1412,10 @@ impl Volume {
                     pad_byte = true;
                 }
 
+                if offset + 2 + directory_bitmap_len > enumerate_cmd.max_reply_size as usize {
+                    break;
+                }
+
                 output[entry_offset] = (directory_bitmap_len + 2) as u8;
                 entry_offset += 1;
 
@@ -1452,6 +1456,10 @@ impl Volume {
                     pad_byte = true;
                 }
 
+                if offset + 2 + file_bitmap_len > enumerate_cmd.max_reply_size as usize {
+                    break;
+                }
+
                 output[entry_offset] = (file_bitmap_len + 2) as u8;
                 entry_offset += 1;
 
@@ -1486,9 +1494,6 @@ impl Volume {
                 }
             }
 
-            if offset >= enumerate_cmd.max_reply_size as usize {
-                break;
-            }
         }
 
         output[count_offset..count_offset + 2].copy_from_slice(&actual_count.to_be_bytes());
@@ -1981,6 +1986,66 @@ mod tests {
         println!("Enumerated {} items", count);
 
         assert_eq!(count, 2, "Should have found 2 files");
+    }
+
+    // Regression test for the ATP bitmap truncation bug:
+    // enumerate() must never write more bytes than max_reply_size, even when
+    // the last entry that fits would push the offset exactly over the limit.
+    //
+    // Entry size arithmetic for LONG_NAME | FILE_NUMBER with a 10-char name:
+    //   response_len(10) = long_name_offset(6) + 10 + 1 = 17  (odd → padded to 18)
+    //   bytes per entry  = 1 (length field) + 1 (type field) + 18 = 20
+    //
+    // With max_reply_size=55 and a 2-byte count prefix at offset 0:
+    //   Entry 1 starts at offset  2; would end at 22 — fits (22 ≤ 55)  → include
+    //   Entry 2 starts at offset 22; would end at 42 — fits (42 ≤ 55)  → include
+    //   Entry 3 starts at offset 42; would end at 62 — does NOT fit    → stop
+    //
+    // Before the fix the check fired AFTER writing, so all 3 entries were
+    // included and offset=62 was returned, overflowing max_reply_size by 7 bytes.
+    #[tokio::test]
+    async fn test_enumerate_respects_max_reply_size() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+
+        // 10-char names, all files
+        for i in 0..10u32 {
+            File::create(root_path.join(format!("file_{}.txt", i)))
+                .await
+                .unwrap();
+        }
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path, 1).await;
+
+        let bitmap = FPFileBitmap::LONG_NAME | FPFileBitmap::FILE_NUMBER;
+        let max_reply_size: u16 = 55;
+
+        let enumerate_cmd = FPEnumerate {
+            volume_id: 1,
+            directory_id: 2,
+            file_bitmap: bitmap,
+            directory_bitmap: FPDirectoryBitmap::empty(),
+            req_count: 100,
+            start_index: 1,
+            max_reply_size,
+            path: "".into(),
+        };
+
+        let mut output = [0u8; 512];
+        let offset = volume
+            .enumerate(enumerate_cmd, &mut output)
+            .await
+            .unwrap();
+
+        assert!(
+            offset <= max_reply_size as usize,
+            "enumerate wrote {} bytes but max_reply_size is {}",
+            offset,
+            max_reply_size
+        );
+
+        let count = u16::from_be_bytes(output[0..2].try_into().unwrap());
+        assert_eq!(count, 2, "expected exactly 2 entries to fit in {} bytes", max_reply_size);
     }
 
     #[tokio::test]
