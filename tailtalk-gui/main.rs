@@ -5,11 +5,46 @@ use std::rc::Rc;
 
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use slint::SharedString;
+use serde::{Deserialize, Serialize};
 use tailtalk::ShutdownHandle;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{filter::LevelFilter, prelude::*};
 
 slint::include_modules!();
+
+// ── Persisted user configuration ──────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
+struct AppConfig {
+    server_name: Option<String>,
+    volume_name: Option<String>,
+    volume_path: Option<String>,
+    // Stored as the port path string so it survives device re-enumeration.
+    tashtalk_port: Option<String>,
+    ethernet_interface: Option<String>,
+}
+
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("TailTalk").join("config.toml"))
+}
+
+fn load_config() -> AppConfig {
+    config_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+fn save_config(config: &AppConfig) {
+    let Some(path) = config_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = toml::to_string(config) {
+        let _ = std::fs::write(path, s);
+    }
+}
 
 // ── Commands sent from the UI thread to the tokio server task ─────────────────
 
@@ -157,6 +192,33 @@ fn main() -> anyhow::Result<()> {
         ui.set_tashtalk_ports(tash_model);
     }
 
+    // Restore previously saved settings
+    {
+        let config = load_config();
+        if let Some(ref v) = config.server_name {
+            ui.set_server_name(v.as_str().into());
+        }
+        if let Some(ref v) = config.volume_name {
+            ui.set_volume_name(v.as_str().into());
+        }
+        if let Some(ref v) = config.volume_path {
+            ui.set_volume_path(v.as_str().into());
+        }
+        #[cfg(feature = "ethertalk")]
+        if let Some(ref iface) = config.ethernet_interface {
+            if let Some(idx) = ethernet_names.iter().position(|n| n == iface) {
+                ui.set_selected_ethernet(idx as i32);
+            }
+        }
+        #[cfg(feature = "tashtalk")]
+        if let Some(ref port) = config.tashtalk_port {
+            // index 0 is "None"; device entries start at 1
+            if let Some(idx) = tashtalk_devices.iter().position(|d| &d.path == port) {
+                ui.set_selected_tashtalk((idx + 1) as i32);
+            }
+        }
+    }
+
     let ui_handle = ui.as_weak();
     std::thread::spawn(move || {
         tokio::runtime::Runtime::new()
@@ -215,6 +277,24 @@ fn main() -> anyhow::Result<()> {
                 tracing::error!("No volume path selected");
                 return;
             }
+
+            save_config(&AppConfig {
+                server_name: Some(ui.get_server_name().to_string()),
+                volume_name: Some(ui.get_volume_name().to_string()),
+                volume_path: Some(ui.get_volume_path().to_string()),
+                tashtalk_port: {
+                    #[cfg(feature = "tashtalk")]
+                    { tashtalk.clone() }
+                    #[cfg(not(feature = "tashtalk"))]
+                    { None }
+                },
+                ethernet_interface: {
+                    #[cfg(feature = "ethertalk")]
+                    { ethernet.clone() }
+                    #[cfg(not(feature = "ethertalk"))]
+                    { None }
+                },
+            });
 
             let _ = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),

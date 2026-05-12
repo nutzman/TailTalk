@@ -24,6 +24,8 @@ tracing = { workspace = true } #unified
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
 dirs = "5"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 if-addrs = { version = "0.13", optional = true }
 serialport = { version = "4", optional = true }
 
