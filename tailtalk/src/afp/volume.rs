@@ -43,7 +43,9 @@ impl Node {
     }
 
     pub async fn close_data_fork(&mut self) {
-        self.data_fork = None;
+        if let Some(file) = self.data_fork.take() {
+            let _ = file.sync_data().await;
+        }
     }
 
     pub async fn open_resource_fork(&mut self, sidecar_path: &Path) -> std::io::Result<()> {
@@ -62,7 +64,9 @@ impl Node {
     }
 
     pub async fn close_resource_fork(&mut self) {
-        self.resource_fork = None;
+        if let Some(file) = self.resource_fork.take() {
+            let _ = file.sync_data().await;
+        }
     }
 
     /// Read Finder Info from the platform xattr.
