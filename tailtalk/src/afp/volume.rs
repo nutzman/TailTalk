@@ -242,6 +242,26 @@ pub fn rsrc_path(volume_root: &Path, relative_path: &Path) -> PathBuf {
         .join(relative_path)
 }
 
+/// Converts an AFP path string to a POSIX PathBuf.
+///
+/// AFP uses ':' as the path separator and allows '/' as a literal character in filenames.
+/// POSIX uses '/' as the path separator and allows ':' in filenames.
+/// macOS HFS+/APFS maps POSIX ':' ↔ Mac '/'.
+pub(super) fn afp_path_to_posix(afp_path: &str) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in afp_path.split(':') {
+        if !component.is_empty() {
+            result.push(component.replace('/', ":"));
+        }
+    }
+    result
+}
+
+/// Converts a POSIX filename to the AFP name sent to Mac clients.
+/// POSIX ':' represents what HFS calls '/', so we map it back.
+fn posix_name_to_afp(name: &str) -> String {
+    name.replace(':', "/")
+}
 
 /// Returns true if `path` represents an AFP empty path — either a zero-length OS string
 /// or one composed entirely of null bytes (the AFP wire encoding for "this node itself").
@@ -516,11 +536,12 @@ impl Volume {
         let node = Node {
             id: new_id,
             parent_id: directory_id,
-            name: path_name
-                .file_name()
-                .ok_or(AfpError::ObjectNotFound)?
-                .to_string_lossy()
-                .to_string(),
+            name: posix_name_to_afp(
+                &path_name
+                    .file_name()
+                    .ok_or(AfpError::ObjectNotFound)?
+                    .to_string_lossy(),
+            ),
             is_dir: true,
             path: full_relative_path.clone(),
             data_fork: None,
@@ -575,11 +596,12 @@ impl Volume {
         let node = Node {
             id: new_id,
             parent_id: directory_id,
-            name: full_relative_path
-                .file_name()
-                .ok_or(AfpError::ObjectNotFound)?
-                .to_string_lossy()
-                .to_string(),
+            name: posix_name_to_afp(
+                &full_relative_path
+                    .file_name()
+                    .ok_or(AfpError::ObjectNotFound)?
+                    .to_string_lossy(),
+            ),
             is_dir: false,
             path: full_relative_path.clone(),
             data_fork: None,
@@ -626,7 +648,7 @@ impl Volume {
                     let node = Node {
                         id: new_id,
                         parent_id,
-                        name: entry.file_name().to_string_lossy().to_string(),
+                        name: posix_name_to_afp(&entry.file_name().to_string_lossy()),
                         is_dir,
                         path: rel_path_buf.clone(),
                         data_fork: None,
@@ -677,7 +699,7 @@ impl Volume {
                 Node {
                     id: new_id,
                     parent_id: dir_id,
-                    name,
+                    name: posix_name_to_afp(&name),
                     is_dir,
                     path: rel_path.clone(),
                     data_fork: None,
@@ -1313,8 +1335,10 @@ impl Volume {
         enumerate_cmd: FPEnumerate,
         output: &mut [u8],
     ) -> Result<usize, AfpError> {
-        let node_id =
-            self.resolve_node(enumerate_cmd.directory_id, Path::new(&enumerate_cmd.path))?;
+        let node_id = self.resolve_node(
+            enumerate_cmd.directory_id,
+            &afp_path_to_posix(enumerate_cmd.path.as_str()),
+        )?;
 
         let (node_is_dir, node_path) = {
             let node = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?;
@@ -1392,7 +1416,7 @@ impl Volume {
                 let new_node = Node {
                     id: new_id,
                     parent_id: node_id,
-                    name: name.clone(),
+                    name: posix_name_to_afp(name),
                     is_dir: *is_dir,
                     path: entry_relative_path.clone(),
                     data_fork: None,
@@ -1631,13 +1655,15 @@ impl Volume {
             n.path.clone()
         };
 
-        let effective_name = if new_name.is_empty() {
+        // src_old_name is the AFP name (node.name invariant); new_name is AFP from the client.
+        let effective_afp_name = if new_name.is_empty() {
             src_old_name.clone()
         } else {
             new_name.to_string()
         };
+        let effective_posix_name = effective_afp_name.replace('/', ":");
 
-        let new_relative = dst_relative.join(&effective_name);
+        let new_relative = dst_relative.join(&effective_posix_name);
 
         // Conflict check — allow same-path (pure rename or no-op move).
         if new_relative != src_old_relative && self.path_to_id.contains_key(&new_relative) {
@@ -1671,7 +1697,7 @@ impl Volume {
         {
             let node = self.nodes.get_mut(&src_node_id).unwrap();
             node.parent_id = dst_node_id;
-            node.name = effective_name;
+            node.name = effective_afp_name;
             node.path = new_relative.clone();
         }
 
@@ -1712,7 +1738,10 @@ impl Volume {
 
     pub async fn delete(&mut self, delete_req: &FPDelete) -> Result<(), AfpError> {
         let node_id = self
-            .resolve_node_lazy(delete_req.directory_id, Path::new(&delete_req.path))
+            .resolve_node_lazy(
+                delete_req.directory_id,
+                &afp_path_to_posix(delete_req.path.as_str()),
+            )
             .await?;
 
         // Cannot delete root
@@ -1801,9 +1830,11 @@ impl Volume {
             n.path.clone()
         };
 
-        let effective_name = if new_name.is_empty() { &src_name } else { new_name };
+        // src_name is the AFP name (node.name invariant); new_name is AFP from the client.
+        let effective_afp_name = if new_name.is_empty() { src_name.as_str() } else { new_name };
+        let effective_posix_name = effective_afp_name.replace('/', ":");
 
-        let new_relative = dst_relative.join(effective_name);
+        let new_relative = dst_relative.join(&effective_posix_name);
         if self.path_to_id.contains_key(&new_relative) {
             return Err(AfpError::ObjectExists);
         }
@@ -1832,7 +1863,7 @@ impl Volume {
         let node = Node {
             id: new_id,
             parent_id: dst_node_id,
-            name: effective_name.to_string(),
+            name: effective_afp_name.to_string(),
             is_dir: false,
             path: new_relative.clone(),
             data_fork: None,

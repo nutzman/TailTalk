@@ -1,3 +1,4 @@
+use crate::afp::volume::afp_path_to_posix;
 use crate::afp::Volume;
 use crate::asp::{Asp, AspCommandResponse, AspHandle, AspSession};
 use crate::ddp::DdpHandle;
@@ -471,7 +472,7 @@ impl AspSession {
         );
 
         match our_volume
-            .create_dir(cmd.directory_id, PathBuf::from(cmd.path.to_string()))
+            .create_dir(cmd.directory_id, afp_path_to_posix(cmd.path.as_str()))
             .await
         {
             Ok(dir_id) => {
@@ -507,7 +508,7 @@ impl AspSession {
             .create_file(
                 cmd.create_flag,
                 cmd.directory_id,
-                PathBuf::from(cmd.path.to_string()),
+                afp_path_to_posix(cmd.path.as_str()),
             )
             .await
         {
@@ -544,8 +545,8 @@ impl AspSession {
             }
         };
 
-        let src_path = PathBuf::from(cmd.src_path.to_string());
-        let dst_path = PathBuf::from(cmd.dst_path.to_string());
+        let src_path = afp_path_to_posix(cmd.src_path.as_str());
+        let dst_path = afp_path_to_posix(cmd.dst_path.as_str());
         debug!(
             "AFP FPCopyFile req: src_vol={}, src_dir={}, dst_vol={}, dst_dir={}, src={:?}, dst={:?}, new_name={:?}",
             cmd.src_volume_id, cmd.src_directory_id, cmd.dst_volume_id, cmd.dst_directory_id,
@@ -630,7 +631,7 @@ impl AspSession {
         let cmd = FPGetFileDirParms::parse(&command.data[2..]).unwrap();
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = cmd.dir_bitmap;
-        let path_name_buf = PathBuf::from(cmd.path.to_string());
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
             "AFP FPGetFileDirParms req: dir_id={}, path={:?}, file_bitmap={:?}, dir_bitmap={:?}",
             cmd.directory_id, path_name_buf, file_bitmap, dir_bitmap
@@ -702,7 +703,7 @@ impl AspSession {
         let cmd = FPSetFileDirParms::parse(&command.data[2..]).unwrap();
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = FPDirectoryBitmap::from(cmd.file_bitmap.bits());
-        let path_name_buf = PathBuf::from(cmd.path.to_string());
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
             "AFP FPSetFileDirParms req: dir_id={}, path={:?}, bitmap={:?}",
             cmd.directory_id, path_name_buf, file_bitmap
@@ -763,8 +764,8 @@ impl AspSession {
             }
         };
 
-        let src_path = PathBuf::from(cmd.src_path.to_string());
-        let dst_path = PathBuf::from(cmd.dst_path.to_string());
+        let src_path = afp_path_to_posix(cmd.src_path.as_str());
+        let dst_path = afp_path_to_posix(cmd.dst_path.as_str());
         debug!(
             "AFP FPMoveAndRename req: src_dir={}, dst_dir={}, src={:?}, dst={:?}, new_name={:?}",
             cmd.src_directory_id, cmd.dst_directory_id, src_path, dst_path, cmd.new_name
@@ -823,7 +824,7 @@ impl AspSession {
         match our_volume
             .rename(
                 cmd.directory_id,
-                &PathBuf::from(cmd.path.to_string()),
+                &afp_path_to_posix(cmd.path.as_str()),
                 cmd.new_name.as_str(),
             )
             .await
@@ -853,7 +854,7 @@ impl AspSession {
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
         let dir_cmd = FPSetDirParms::parse(&command.data[2..]).unwrap();
-        let path_name_buf = PathBuf::from(dir_cmd.path.to_string());
+        let path_name_buf = afp_path_to_posix(dir_cmd.path.as_str());
         debug!(
             "AFP FPSetDirParms req: dir_id={}, path={:?}, bitmap={:?}",
             dir_cmd.directory_id, path_name_buf, dir_cmd.dir_bitmap
@@ -1065,7 +1066,7 @@ impl AspSession {
         // 0x00 = data fork, 0x80 = resource fork.
         let fork_type = ForkType::from(command.data[1] & 0x80);
         let cmd = FPOpenFork::parse(&command.data[2..]).unwrap();
-        let path_name_buf = PathBuf::from(cmd.path.to_string());
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
             "AFP FPOpenFork req: fork={:?}, dir_id={}, path={:?}, bitmap={:?}, access={:#06x}",
             fork_type, cmd.directory_id, path_name_buf, cmd.file_bitmap, cmd.access_mode
@@ -1448,7 +1449,7 @@ impl AspSession {
 
         match our_volume.set_comment(
             add_comment.directory_id,
-            &PathBuf::from(add_comment.path.as_str()),
+            &afp_path_to_posix(add_comment.path.as_str()),
             &add_comment.comment,
         ) {
             Ok(_) => {
@@ -1484,7 +1485,7 @@ impl AspSession {
 
         match our_volume.get_comment(
             get_comment.directory_id,
-            &PathBuf::from(get_comment.path.as_str()),
+            &afp_path_to_posix(get_comment.path.as_str()),
         ) {
             Ok(comment) => {
                 debug!("AFP FPGetComment resp: OK {} bytes", comment.len());
@@ -1523,7 +1524,7 @@ impl AspSession {
 
         match our_volume.remove_comment(
             remove_comment.directory_id,
-            &PathBuf::from(remove_comment.path.as_str()),
+            &afp_path_to_posix(remove_comment.path.as_str()),
         ) {
             Ok(_) => {
                 debug!("AFP FPRemoveComment resp: OK");
