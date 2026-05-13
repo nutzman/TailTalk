@@ -21,6 +21,9 @@ pub struct AspCommand {
     pub client_address: crate::atp::AtpAddress,
     /// The command data payload
     pub data: Vec<u8>,
+    /// Maximum bytes the client can receive in the ATP response for this command.
+    /// Derived from the ATP TReq bitmap. AFP handlers must not send more than this.
+    pub atp_max_response_bytes: usize,
     /// Channel to send the reply back to the client
     reply_tx: oneshot::Sender<AspCommandResponse>,
 }
@@ -332,6 +335,7 @@ impl Asp {
                                         sequence_number: header.sequence_number,
                                         client_address: req.source,
                                         data: req.data.clone(),
+                                        atp_max_response_bytes: req.max_response_bytes(),
                                         reply_tx,
                                     };
 

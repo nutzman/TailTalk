@@ -925,7 +925,12 @@ impl AspSession {
             read_cmd.fork_id, read_cmd.offset, read_cmd.req_count
         );
 
-        let mut output_buf = [0u8; 4096];
+        // Cap the output buffer to the ATP transport limit for this request.
+        // req_count is allowed to exceed the ATP QuantumSize per spec; the server
+        // must truncate to what fits so the client can issue a follow-up read.
+        let atp_limit = command.atp_max_response_bytes;
+        let effective_len = (read_cmd.req_count as usize).min(atp_limit).min(4096);
+        let mut output_buf = vec![0u8; effective_len];
 
         match our_volume.read(&read_cmd, &mut output_buf).await {
             Ok((bytes_read, is_eof)) => {
@@ -1187,10 +1192,11 @@ impl AspSession {
         output_buf[2..4].copy_from_slice(&enumerate.directory_bitmap.bits().to_be_bytes());
 
         let start_offset = 4u16;
-        // The bitmap header we prepend eats into the ATP payload, so shrink the
-        // effective limit so the enumerate payload + header never exceeds what the
-        // client declared it can receive.
-        enumerate.max_reply_size = enumerate.max_reply_size.saturating_sub(start_offset);
+        // max_reply_size can exceed what ATP will actually deliver, so clamp to whichever is tighter.
+        let atp_payload_limit = command.atp_max_response_bytes.saturating_sub(start_offset as usize);
+        enumerate.max_reply_size = enumerate.max_reply_size
+            .saturating_sub(start_offset)
+            .min(atp_payload_limit as u16);
 
         match our_volume
             .enumerate(enumerate, &mut output_buf[start_offset as usize..])

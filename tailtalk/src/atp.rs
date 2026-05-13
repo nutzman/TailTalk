@@ -89,6 +89,15 @@ pub struct AtpReceivedRequest {
 }
 
 impl AtpReceivedRequest {
+    /// Returns the maximum number of response data bytes this request can accept,
+    /// derived from the client's ATP bitmap. Use this to cap response payloads
+    /// before calling send_response so AFP/ASP layers can truncate cleanly.
+    pub fn max_response_bytes(&self) -> usize {
+        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
+        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
+        max_packets * ATP_MAX_DATA_PER_PACKET
+    }
+
     /// Send a response with automatic fragmentation.
     ///
     /// Respects the client's ATP bitmap: only sends as many packets as the client
