@@ -332,6 +332,9 @@ impl AspSession {
                 tailtalk_packets::afp::AFP_CMD_FLUSH => {
                     self.handle_flush(command, &mut our_volume).await?;
                 }
+                tailtalk_packets::afp::AFP_CMD_FLUSH_FORK => {
+                    self.handle_flush_fork(command, &mut our_volume).await?;
+                }
                 tailtalk_packets::afp::AFP_CMD_OPEN_DT => {
                     debug!("AFP FPOpenDT req: (no params)");
                     match our_volume.open_dt().await {
@@ -362,6 +365,15 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_COMMENT => {
                     self.handle_get_comment(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_ADD_APPL => {
+                    self.handle_add_appl(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_REMOVE_APPL => {
+                    self.handle_remove_appl(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_GET_APPL => {
+                    self.handle_get_appl(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_WRITE => {
                     self.handle_write(command, &mut our_volume).await?;
@@ -906,6 +918,25 @@ impl AspSession {
         let _ = our_volume.sync().await;
 
         debug!("AFP FPFlush resp: OK");
+        command.send_reply(AspCommandResponse {
+            result: [0u8; 4],
+            data: Vec::new(),
+        })?;
+
+        Ok(())
+    }
+
+    async fn handle_flush_fork(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let flush_cmd = tailtalk_packets::afp::FPFlushFork::parse(&command.data[2..]).unwrap();
+        debug!("AFP FPFlushFork req: fork_id={}", flush_cmd.fork_id);
+
+        let _ = our_volume.sync().await;
+
+        debug!("AFP FPFlushFork resp: OK");
         command.send_reply(AspCommandResponse {
             result: [0u8; 4],
             data: Vec::new(),
@@ -1512,6 +1543,118 @@ impl AspSession {
 
         Ok(())
     }
+
+    async fn handle_add_appl(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let req = tailtalk_packets::afp::FPAddAPPL::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPAddAPPL req: dt_ref={}, creator={:#010x}, tag={:#010x}, dir_id={}, path={:?}",
+            req.dt_ref_num,
+            u32::from_be_bytes(req.file_creator),
+            req.tag,
+            req.directory_id,
+            req.path.as_str()
+        );
+
+        match our_volume.add_appl(&req) {
+            Ok(_) => {
+                debug!("AFP FPAddAPPL resp: OK");
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: vec![],
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPAddAPPL resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as i32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_remove_appl(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let req = tailtalk_packets::afp::FPRemoveAPPL::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPRemoveAPPL req: dt_ref={}, creator={:#010x}, dir_id={}, path={:?}",
+            req.dt_ref_num,
+            u32::from_be_bytes(req.file_creator),
+            req.directory_id,
+            req.path.as_str()
+        );
+
+        match our_volume.remove_appl(&req) {
+            Ok(_) => {
+                debug!("AFP FPRemoveAPPL resp: OK");
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: vec![],
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPRemoveAPPL resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as i32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn handle_get_appl(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let req = tailtalk_packets::afp::FPGetAPPL::parse(&command.data[2..]).unwrap();
+        debug!(
+            "AFP FPGetAPPL req: dt_ref={}, creator={:#010x}, index={}",
+            req.dt_ref_num,
+            u32::from_be_bytes(req.file_creator),
+            req.appl_index
+        );
+
+        match our_volume.get_appl(&req) {
+            Ok((tag, directory_id, path)) => {
+                debug!(
+                    "AFP FPGetAPPL resp: OK tag={:#010x}, dir_id={}, path={:?}",
+                    tag, directory_id, path
+                );
+                let path_bytes = path.as_bytes();
+                let mut data = Vec::with_capacity(9 + path_bytes.len());
+                data.extend_from_slice(&tag.to_be_bytes());
+                data.extend_from_slice(&directory_id.to_be_bytes());
+                data.push(0x02); // PathType: LongName
+                data.push(path_bytes.len() as u8);
+                data.extend_from_slice(path_bytes);
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data,
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPGetAPPL resp: err={:?}", e);
+                command.send_reply(AspCommandResponse {
+                    result: (e as i32).to_be_bytes(),
+                    data: Vec::new(),
+                })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// Create a successful login reply
@@ -1546,6 +1689,7 @@ fn afp_cmd_name(code: u8) -> &'static str {
         8 => "FPDelete",
         9 => "FPEnumerate",
         10 => "FPFlush",
+        11 => "FPFlushFork",
         14 => "FPGetForkParms",
         16 => "FPGetSrvrParms",
         17 => "FPGetVolParms",
@@ -1567,6 +1711,8 @@ fn afp_cmd_name(code: u8) -> &'static str {
         51 => "FPGetIcon",
         52 => "FPGetIconInfo",
         53 => "FPAddAPPL",
+        54 => "FPRemoveAPPL",
+        55 => "FPGetAPPL",
         56 => "FPAddComment",
         57 => "FPRemoveComment",
         58 => "FPGetComment",

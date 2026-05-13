@@ -192,4 +192,115 @@ impl DesktopDatabase {
         })?;
         Ok(())
     }
+
+    /// Register an application in the Desktop DB.
+    ///
+    /// Key: creator (4) + tag (4, big-endian) — one entry per (creator, tag) pair.
+    /// Value: directory_id (4) + path_len (1) + path bytes.
+    pub fn add_appl(
+        &self,
+        creator: [u8; 4],
+        tag: u32,
+        directory_id: u32,
+        path: &str,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let mut key = [0u8; 8];
+        key[0..4].copy_from_slice(&creator);
+        key[4..8].copy_from_slice(&tag.to_be_bytes());
+
+        let path_bytes = path.as_bytes();
+        let mut value = Vec::with_capacity(5 + path_bytes.len());
+        value.extend_from_slice(&directory_id.to_be_bytes());
+        value.push(path_bytes.len() as u8);
+        value.extend_from_slice(path_bytes);
+
+        tree.insert(key, value).map_err(|e| {
+            error!("Failed to insert APPL: {}", e);
+            AfpError::AccessDenied
+        })?;
+        Ok(())
+    }
+
+    /// Deregister an application identified by (creator, directory_id, path).
+    pub fn remove_appl(
+        &self,
+        creator: [u8; 4],
+        directory_id: u32,
+        path: &str,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let dir_bytes = directory_id.to_be_bytes();
+        let path_bytes = path.as_bytes();
+
+        for result in tree.scan_prefix(creator) {
+            let (key, value) = result.map_err(|e| {
+                error!("Failed to scan APPLs: {}", e);
+                AfpError::AccessDenied
+            })?;
+
+            if value.len() >= 5 {
+                let path_len = value[4] as usize;
+                if &value[0..4] == dir_bytes
+                    && value.len() >= 5 + path_len
+                    && &value[5..5 + path_len] == path_bytes
+                {
+                    tree.remove(&key).map_err(|e| {
+                        error!("Failed to remove APPL: {}", e);
+                        AfpError::AccessDenied
+                    })?;
+                    return Ok(());
+                }
+            }
+        }
+
+        Err(AfpError::ItemNotFound)
+    }
+
+    /// Retrieve a registered application by creator and 1-based index.
+    ///
+    /// Returns (tag, directory_id, path).
+    pub fn get_appl(
+        &self,
+        creator: [u8; 4],
+        index: u16,
+    ) -> Result<(u32, u32, String), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let target = index.saturating_sub(1) as usize;
+        for (i, result) in tree.scan_prefix(creator).enumerate() {
+            let (key, value) = result.map_err(|e| {
+                error!("Failed to scan APPLs: {}", e);
+                AfpError::AccessDenied
+            })?;
+
+            if i == target {
+                if key.len() < 8 || value.len() < 5 {
+                    return Err(AfpError::ItemNotFound);
+                }
+                let tag = u32::from_be_bytes(key[4..8].try_into().unwrap());
+                let directory_id = u32::from_be_bytes(value[0..4].try_into().unwrap());
+                let path_len = value[4] as usize;
+                let path = if value.len() >= 5 + path_len {
+                    String::from_utf8_lossy(&value[5..5 + path_len]).into_owned()
+                } else {
+                    String::new()
+                };
+                return Ok((tag, directory_id, path));
+            }
+        }
+
+        Err(AfpError::ItemNotFound)
+    }
 }

@@ -15,6 +15,7 @@ pub const AFP_CMD_CREATE_FILE: u8 = 7;
 pub const AFP_CMD_DELETE: u8 = 8;
 pub const AFP_CMD_ENUMERATE: u8 = 9;
 pub const AFP_CMD_FLUSH: u8 = 10;
+pub const AFP_CMD_FLUSH_FORK: u8 = 11;
 pub const AFP_CMD_GET_FORK_PARMS: u8 = 14;
 pub const AFP_CMD_GET_SRVR_PARMS: u8 = 16;
 pub const AFP_CMD_GET_VOL_PARMS: u8 = 17;
@@ -36,6 +37,8 @@ pub const AFP_CMD_CLOSE_DT: u8 = 49;
 pub const AFP_CMD_GET_ICON: u8 = 51;
 pub const AFP_CMD_GTICNINFO: u8 = 52;
 pub const AFP_CMD_ADD_APPL: u8 = 53;
+pub const AFP_CMD_REMOVE_APPL: u8 = 54;
+pub const AFP_CMD_GET_APPL: u8 = 55;
 pub const AFP_CMD_ADD_COMMENT: u8 = 56;
 pub const AFP_CMD_REMOVE_COMMENT: u8 = 57;
 pub const AFP_CMD_GET_COMMENT: u8 = 58;
@@ -610,6 +613,20 @@ impl FPFlush {
     }
 }
 
+pub struct FPFlushFork {
+    pub fork_id: u16,
+}
+
+impl FPFlushFork {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 2 {
+            return Err(AfpError::InvalidSize);
+        }
+        let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        Ok(Self { fork_id })
+    }
+}
+
 pub struct FPGetVolParms {
     pub volume_id: u16,
     pub bitmap: FPVolumeBitmap,
@@ -814,6 +831,96 @@ impl FPAddComment {
             path,
             comment: comment_data,
         })
+    }
+}
+
+/// FPAddAPPL: register an application in the Desktop Database.
+///
+/// Wire layout (buf = data[2..], after command + pad):
+///   [0..2]   DTRefNum
+///   [2..6]   FileCreator (4-byte OSType)
+///   [6..10]  Tag (u32, application version tag)
+///   [10..14] DirectoryID (directory containing the application)
+///   [14]     PathType
+///   [15..]   Pathname (Pascal string)
+#[derive(Debug)]
+pub struct FPAddAPPL {
+    pub dt_ref_num: u16,
+    pub file_creator: [u8; 4],
+    pub tag: u32,
+    pub directory_id: u32,
+    pub path: MacString,
+}
+
+impl FPAddAPPL {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 16 {
+            return Err(AfpError::InvalidSize);
+        }
+        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
+        let tag = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[10..14].as_array().unwrap());
+        let _path_type = buf[14];
+        let path = MacString::try_from(&buf[15..])?;
+        Ok(Self { dt_ref_num, file_creator, tag, directory_id, path })
+    }
+}
+
+/// FPRemoveAPPL: deregister an application from the Desktop Database.
+///
+/// Wire layout (buf = data[2..], after command + pad):
+///   [0..2]   DTRefNum
+///   [2..6]   FileCreator (4-byte OSType)
+///   [6..10]  DirectoryID
+///   [10]     PathType
+///   [11..]   Pathname (Pascal string)
+#[derive(Debug)]
+pub struct FPRemoveAPPL {
+    pub dt_ref_num: u16,
+    pub file_creator: [u8; 4],
+    pub directory_id: u32,
+    pub path: MacString,
+}
+
+impl FPRemoveAPPL {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 12 {
+            return Err(AfpError::InvalidSize);
+        }
+        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
+        let directory_id = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
+        let _path_type = buf[10];
+        let path = MacString::try_from(&buf[11..])?;
+        Ok(Self { dt_ref_num, file_creator, directory_id, path })
+    }
+}
+
+/// FPGetAPPL: retrieve a registered application by creator and 1-based index.
+///
+/// Wire layout (buf = data[2..], after command + pad):
+///   [0..2]  DTRefNum
+///   [2..6]  FileCreator (4-byte OSType)
+///   [6..8]  APPLIndex (u16, 1-based)
+///
+/// Response: Tag(4) + DirectoryID(4) + PathType(1) + Pathname
+#[derive(Debug)]
+pub struct FPGetAPPL {
+    pub dt_ref_num: u16,
+    pub file_creator: [u8; 4],
+    pub appl_index: u16,
+}
+
+impl FPGetAPPL {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 8 {
+            return Err(AfpError::InvalidSize);
+        }
+        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
+        let appl_index = u16::from_be_bytes(*buf[6..8].as_array().unwrap());
+        Ok(Self { dt_ref_num, file_creator, appl_index })
     }
 }
 

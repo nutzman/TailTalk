@@ -1910,6 +1910,42 @@ impl Volume {
         Ok(data.len())
     }
 
+    pub fn add_appl(
+        &self,
+        req: &tailtalk_packets::afp::FPAddAPPL,
+    ) -> Result<(), AfpError> {
+        if let Some(ref db) = self.desktop_database
+            && db.dt_ref_num == req.dt_ref_num
+        {
+            return db.add_appl(req.file_creator, req.tag, req.directory_id, req.path.as_str());
+        }
+        Err(AfpError::ItemNotFound)
+    }
+
+    pub fn remove_appl(
+        &self,
+        req: &tailtalk_packets::afp::FPRemoveAPPL,
+    ) -> Result<(), AfpError> {
+        if let Some(ref db) = self.desktop_database
+            && db.dt_ref_num == req.dt_ref_num
+        {
+            return db.remove_appl(req.file_creator, req.directory_id, req.path.as_str());
+        }
+        Err(AfpError::ItemNotFound)
+    }
+
+    pub fn get_appl(
+        &self,
+        req: &tailtalk_packets::afp::FPGetAPPL,
+    ) -> Result<(u32, u32, String), AfpError> {
+        if let Some(ref db) = self.desktop_database
+            && db.dt_ref_num == req.dt_ref_num
+        {
+            return db.get_appl(req.file_creator, req.appl_index);
+        }
+        Err(AfpError::ItemNotFound)
+    }
+
     pub fn set_comment(
         &self,
         directory_id: u32,
