@@ -54,14 +54,18 @@ The resulting bundle will be placed in dist/.
 
 ## TashTalk USB
 
-This project supports using the TashTalk USB (and regular TashTalk) for communicating
-over LocalTalk. For Linux users, you typically need to be in the "dialout" group
-to have the right permissions to open the serial device as your regular user:
-```bash
-sudo gpasswd -a $USER dialout
+TashTalk USB uses a Silicon Labs CP210x USB-to-UART bridge (VID `10c4`, PID `ea60`). On Linux, the `cp210x` kernel
+module handles this automatically, but by default the device node is only accessible by root. To grant your user
+access without requiring root, create a udev rule:
+
+```sh
+echo 'SUBSYSTEM=="tty", ATTRS{idVendor}=="10c4", ATTRS{idProduct}=="ea60", TAG+="uaccess"' \
+  | sudo tee /etc/udev/rules.d/99-tashtalk-usb.rules
+sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-A log out and back in again is usually required for this to take effect.
+After running these commands, unplug and re-plug the TashTalk USB device. It will appear as `/dev/ttyUSB0` (or
+similar) and be accessible without root.
 
 ## Existing Programs
 There are 4 demo programs I have written to verify the functionality of this software as I have developed it:
