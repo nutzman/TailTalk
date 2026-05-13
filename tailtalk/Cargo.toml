@@ -1,6 +1,6 @@
 [package]
 name = "tailtalk"
-version = "0.1.2"
+version.workspace = true
 edition = "2024"
 license-file = "../LICENSE"
 description = "A modern async user space AppleTalk stack with Rust + Tokio "
