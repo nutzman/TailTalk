@@ -387,6 +387,7 @@ impl PacketProcessor {
                 }
 
                 tracing::info!("Starting TashTalk async loop");
+                let mut last_receive_was_error = false;
                 loop {
                     tokio::select! {
                         _ = tash_token.cancelled() => break,
@@ -402,6 +403,7 @@ impl PacketProcessor {
                         res = tashtalk_instance.receive_frame() => {
                             match res {
                                 Ok(Some(data)) => {
+                                    last_receive_was_error = false;
                                     if data.len() < 3 { continue; }
                                     if let Ok(llap) = LlapPacket::parse(&data) {
                                         match llap.type_ {
@@ -445,8 +447,17 @@ impl PacketProcessor {
                                         }
                                     }
                                 }
-                                Ok(None) => break,
+                                Ok(None) => {
+                                    // tokio-util emits one None after every decode error as a
+                                    // recovery artifact; only treat None as real EOF otherwise.
+                                    if last_receive_was_error {
+                                        last_receive_was_error = false;
+                                        continue;
+                                    }
+                                    break;
+                                }
                                 Err(e) => {
+                                    last_receive_was_error = true;
                                     tracing::error!("TashTalk receive error: {:?}", e);
                                 }
                             }
