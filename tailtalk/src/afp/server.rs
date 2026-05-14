@@ -9,9 +9,10 @@ use std::sync::Arc;
 use tailtalk_packets::afp::{
     AFP_CMD_COPY_FILE, AFP_CMD_LOGOUT, AFP_CMD_MOVE_AND_RENAME, AFP_CMD_RENAME, AfpError, AfpUam,
     AfpVersion, FPByteRangeLock, FPCloseFork, FPCopyFile, FPCreateDir, FPCreateFile, FPDelete,
-    FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPFlush, FPGetFileDirParms, FPGetForkParms,
-    FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename, FPOpenFork, FPRead, FPRename,
-    FPSetDirParms, FPSetFileDirParms, FPSetForkParms, FPVolumeBitmap, ForkType,
+    FPDirectoryBitmap, FPEnumerate, FPFileBitmap, FPFlush, FPGetDirParms, FPGetFileDirParms,
+    FPGetFileParms, FPGetForkParms, FPGetSrvrInfo, FPGetSrvrParms, FPGetVolParms, FPMoveAndRename,
+    FPOpenFork, FPRead, FPRename, FPSetDirParms, FPSetFileDirParms, FPSetFileParms, FPSetForkParms,
+    FPVolumeBitmap, ForkType,
 };
 use tailtalk_packets::nbp::EntityName;
 use tracing::{debug, error, info, warn};
@@ -287,6 +288,15 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_READ => {
                     self.handle_read(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_GET_FILE_PARMS => {
+                    self.handle_get_file_parms(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_GET_DIR_PARMS => {
+                    self.handle_get_dir_parms(command, &mut our_volume).await?;
+                }
+                tailtalk_packets::afp::AFP_CMD_SET_FILE_PARMS => {
+                    self.handle_set_file_parms(command, &mut our_volume).await?;
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_FILE_DIR_PARMS => {
                     self.handle_get_file_dir_parms(command, &mut our_volume).await?;
@@ -623,6 +633,172 @@ impl AspSession {
     }
 
     /// Handle AFP_CMD_GET_FILE_DIR_PARMS
+    async fn handle_get_file_parms(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = FPGetFileParms::parse(&command.data[2..]).unwrap();
+        let file_bitmap = cmd.file_bitmap;
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
+        debug!(
+            "AFP FPGetFileParms req: dir_id={}, path={:?}, file_bitmap={:?}",
+            cmd.directory_id, path_name_buf, file_bitmap
+        );
+
+        if cmd.directory_id == 1 {
+            debug!("AFP FPGetFileParms resp: err=ObjectNotFound (dir_id=1)");
+            command.send_reply(create_error_reply(AfpError::ObjectNotFound))?;
+            return Ok(());
+        }
+
+        let node_id = match our_volume.resolve_node_lazy(cmd.directory_id, &path_name_buf).await {
+            Ok(node_id) => node_id,
+            Err(e) => {
+                debug!("AFP FPGetFileParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        let mut output_buf = [0u8; 1024];
+        let (is_dir, bytes_written) = match our_volume
+            .get_node_parms(node_id, file_bitmap, FPDirectoryBitmap::empty(), &mut output_buf[4..])
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                debug!("AFP FPGetFileParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        if is_dir {
+            debug!("AFP FPGetFileParms resp: err=ObjectTypeErr (node is a directory)");
+            command.send_reply(create_error_reply(AfpError::ObjectTypeErr))?;
+            return Ok(());
+        }
+
+        output_buf[0..2].copy_from_slice(&file_bitmap.bits().to_be_bytes());
+        output_buf[2..4].copy_from_slice(&[0, 0]); // pad
+
+        debug!(
+            "AFP FPGetFileParms resp: OK node_id={}, {} param bytes",
+            node_id, bytes_written
+        );
+        command.send_reply(AspCommandResponse {
+            result: [0u8; 4],
+            data: output_buf[..4 + bytes_written].to_vec(),
+        })?;
+
+        Ok(())
+    }
+
+    async fn handle_get_dir_parms(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = FPGetDirParms::parse(&command.data[2..]).unwrap();
+        let dir_bitmap = cmd.dir_bitmap;
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
+        debug!(
+            "AFP FPGetDirParms req: dir_id={}, path={:?}, dir_bitmap={:?}",
+            cmd.directory_id, path_name_buf, dir_bitmap
+        );
+
+        if cmd.directory_id == 1 {
+            debug!("AFP FPGetDirParms resp: err=ObjectNotFound (dir_id=1)");
+            command.send_reply(create_error_reply(AfpError::ObjectNotFound))?;
+            return Ok(());
+        }
+
+        let node_id = match our_volume.resolve_node_lazy(cmd.directory_id, &path_name_buf).await {
+            Ok(node_id) => node_id,
+            Err(e) => {
+                debug!("AFP FPGetDirParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        let mut output_buf = [0u8; 1024];
+        let (is_dir, bytes_written) = match our_volume
+            .get_node_parms(node_id, FPFileBitmap::empty(), dir_bitmap, &mut output_buf[4..])
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                debug!("AFP FPGetDirParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        if !is_dir {
+            debug!("AFP FPGetDirParms resp: err=ObjectTypeErr (node is a file)");
+            command.send_reply(create_error_reply(AfpError::ObjectTypeErr))?;
+            return Ok(());
+        }
+
+        output_buf[0..2].copy_from_slice(&dir_bitmap.bits().to_be_bytes());
+        output_buf[2..4].copy_from_slice(&[0, 0]); // pad
+
+        debug!(
+            "AFP FPGetDirParms resp: OK node_id={}, {} param bytes",
+            node_id, bytes_written
+        );
+        command.send_reply(AspCommandResponse {
+            result: [0u8; 4],
+            data: output_buf[..4 + bytes_written].to_vec(),
+        })?;
+
+        Ok(())
+    }
+
+    async fn handle_set_file_parms(
+        &self,
+        command: crate::asp::AspCommand,
+        our_volume: &mut Volume,
+    ) -> anyhow::Result<()> {
+        let cmd = FPSetFileParms::parse(&command.data[2..]).unwrap();
+        let file_bitmap = cmd.file_bitmap;
+        let path_name_buf = afp_path_to_posix(cmd.path.as_str());
+        debug!(
+            "AFP FPSetFileParms req: dir_id={}, path={:?}, bitmap={:?}",
+            cmd.directory_id, path_name_buf, file_bitmap
+        );
+
+        let node_id = match our_volume.resolve_node_lazy(cmd.directory_id, &path_name_buf).await {
+            Ok(node_id) => node_id,
+            Err(e) => {
+                debug!("AFP FPSetFileParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        };
+
+        match our_volume
+            .set_node_parms(node_id, file_bitmap, FPDirectoryBitmap::empty(), &cmd.params)
+            .await
+        {
+            Ok(_) => {
+                debug!("AFP FPSetFileParms resp: OK node_id={}", node_id);
+                command.send_reply(AspCommandResponse {
+                    result: [0u8; 4],
+                    data: Vec::new(),
+                })?;
+            }
+            Err(e) => {
+                debug!("AFP FPSetFileParms resp: err={:?}", e);
+                command.send_reply(create_error_reply(e))?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_get_file_dir_parms(
         &self,
         command: crate::asp::AspCommand,
@@ -1691,7 +1867,9 @@ fn afp_cmd_name(code: u8) -> &'static str {
         9 => "FPEnumerate",
         10 => "FPFlush",
         11 => "FPFlushFork",
+        13 => "FPGetFileParms",
         14 => "FPGetForkParms",
+        15 => "FPGetDirParms",
         16 => "FPGetSrvrParms",
         17 => "FPGetVolParms",
         18 => "FPLogin",
@@ -1702,6 +1880,7 @@ fn afp_cmd_name(code: u8) -> &'static str {
         27 => "FPRead",
         28 => "FPRename",
         29 => "FPSetDirParms",
+        30 => "FPSetFileParms",
         31 => "FPSetForkParms",
         33 => "FPWrite",
         34 => "FPGetFileDirParms",

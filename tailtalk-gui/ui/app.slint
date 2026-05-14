@@ -110,6 +110,13 @@ export component AppWindow inherits Window {
 
             Button {
                 text: root.running ? "Stop" : "Start";
+                enabled: root.running || (
+                    root.server-name != ""
+                    && root.volume-name != ""
+                    && root.volume-path != ""
+                    && ((root.feature-ethertalk && root.selected-ethernet != 0)
+                        || (root.feature-tashtalk && root.selected-tashtalk != 0))
+                );
                 clicked => { root.start-stop(); }
             }
         }
@@ -124,6 +131,7 @@ export component AppWindow inherits Window {
 
         Rectangle {
             width: 360px;
+            height: dialog-content.preferred-height;
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #f5f5f5;
@@ -131,7 +139,7 @@ export component AppWindow inherits Window {
             drop-shadow-blur: 20px;
             drop-shadow-color: rgba(0, 0, 0, 0.35);
 
-            VerticalBox {
+            dialog-content := VerticalBox {
                 padding: 20px;
                 spacing: 14px;
 
@@ -140,12 +148,14 @@ export component AppWindow inherits Window {
                     font-size: 15px;
                     font-weight: 700;
                     horizontal-alignment: center;
+                    color: #1a1a1a;
                 }
 
                 Text {
                     text: root.error-message;
                     wrap: word-wrap;
                     horizontal-alignment: center;
+                    color: #1a1a1a;
                 }
 
                 HorizontalBox {

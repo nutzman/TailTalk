@@ -16,7 +16,9 @@ pub const AFP_CMD_DELETE: u8 = 8;
 pub const AFP_CMD_ENUMERATE: u8 = 9;
 pub const AFP_CMD_FLUSH: u8 = 10;
 pub const AFP_CMD_FLUSH_FORK: u8 = 11;
+pub const AFP_CMD_GET_FILE_PARMS: u8 = 13;
 pub const AFP_CMD_GET_FORK_PARMS: u8 = 14;
+pub const AFP_CMD_GET_DIR_PARMS: u8 = 15;
 pub const AFP_CMD_GET_SRVR_PARMS: u8 = 16;
 pub const AFP_CMD_GET_VOL_PARMS: u8 = 17;
 pub const AFP_CMD_LOGIN: u8 = 18;
@@ -27,6 +29,7 @@ pub const AFP_CMD_OPEN_FORK: u8 = 26;
 pub const AFP_CMD_READ: u8 = 27;
 pub const AFP_CMD_RENAME: u8 = 28;
 pub const AFP_CMD_SET_DIR_PARMS: u8 = 29;
+pub const AFP_CMD_SET_FILE_PARMS: u8 = 30;
 pub const AFP_CMD_SET_FORK_PARMS: u8 = 31;
 pub const AFP_CMD_WRITE: u8 = 33;
 pub const AFP_CMD_GET_FILE_DIR_PARMS: u8 = 34;
@@ -1180,6 +1183,79 @@ impl FPOpenFork {
         let path_type = PathType::from(buf[10]);
         let path = MacString::try_from(&buf[11..])?;
         Ok(Self { volume_id, directory_id, file_bitmap, access_mode, path_type, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPGetFileParms {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub file_bitmap: FPFileBitmap,
+    pub path: MacString,
+}
+
+impl FPGetFileParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 10 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let _path_type = buf[8];
+        let path = MacString::try_from(&buf[9..])?;
+        Ok(Self { volume_id, directory_id, file_bitmap, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPGetDirParms {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub dir_bitmap: FPDirectoryBitmap,
+    pub path: MacString,
+}
+
+impl FPGetDirParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 10 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let dir_bitmap =
+            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let _path_type = buf[8];
+        let path = MacString::try_from(&buf[9..])?;
+        Ok(Self { volume_id, directory_id, dir_bitmap, path })
+    }
+}
+
+#[derive(Debug)]
+pub struct FPSetFileParms {
+    pub volume_id: u16,
+    pub directory_id: u32,
+    pub file_bitmap: FPFileBitmap,
+    pub path: MacString,
+    pub params: Vec<u8>,
+}
+
+impl FPSetFileParms {
+    pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 10 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
+        let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
+        let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let _path_type = buf[8];
+        let path = MacString::try_from(&buf[9..])?;
+        let mut param_offset = 9 + path.byte_len();
+        if param_offset % 2 != 0 {
+            param_offset += 1;
+        }
+        let params = buf[param_offset..].to_vec();
+        Ok(Self { volume_id, directory_id, file_bitmap, path, params })
     }
 }
 

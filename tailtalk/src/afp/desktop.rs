@@ -249,7 +249,7 @@ impl DesktopDatabase {
 
             if value.len() >= 5 {
                 let path_len = value[4] as usize;
-                if &value[0..4] == dir_bytes
+                if value[0..4] == dir_bytes
                     && value.len() >= 5 + path_len
                     && &value[5..5 + path_len] == path_bytes
                 {

@@ -3,8 +3,13 @@ use std::path::PathBuf;
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use std::rc::Rc;
 
+#[cfg(feature = "tashtalk")]
+use std::cell::RefCell;
+
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use slint::SharedString;
+#[cfg(feature = "tashtalk")]
+use slint::Model as _;
 use serde::{Deserialize, Serialize};
 use tailtalk::ShutdownHandle;
 use tracing_appender::non_blocking::WorkerGuard;
@@ -163,7 +168,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "ethertalk")]
     let ethernet_names = enumerate_ethernet();
     #[cfg(feature = "tashtalk")]
-    let tashtalk_devices = enumerate_serial();
+    let tashtalk_devices = Rc::new(RefCell::new(enumerate_serial()));
 
     #[cfg(feature = "ethertalk")]
     {
@@ -178,19 +183,19 @@ fn main() -> anyhow::Result<()> {
     }
 
     #[cfg(feature = "tashtalk")]
-    {
-        let tash_model: slint::ModelRc<SharedString> = Rc::new(slint::VecModel::from(
-            std::iter::once(SharedString::from("None"))
-                .chain(
-                    tashtalk_devices
-                        .iter()
-                        .map(|d| SharedString::from(d.label.as_str())),
-                )
-                .collect::<Vec<_>>(),
-        ))
-        .into();
-        ui.set_tashtalk_ports(tash_model);
-    }
+    let tash_model = {
+        let entries: Vec<SharedString> = std::iter::once(SharedString::from("None"))
+            .chain(
+                tashtalk_devices
+                    .borrow()
+                    .iter()
+                    .map(|d| SharedString::from(d.label.as_str())),
+            )
+            .collect();
+        let model = Rc::new(slint::VecModel::from(entries));
+        ui.set_tashtalk_ports(model.clone().into());
+        model
+    };
 
     // Restore previously saved settings
     {
@@ -213,7 +218,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "tashtalk")]
         if let Some(ref port) = config.tashtalk_port {
             // index 0 is "None"; device entries start at 1
-            if let Some(idx) = tashtalk_devices.iter().position(|d| &d.path == port) {
+            if let Some(idx) = tashtalk_devices.borrow().iter().position(|d| &d.path == port) {
                 ui.set_selected_tashtalk((idx + 1) as i32);
             }
         }
@@ -230,7 +235,7 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "ethertalk")]
     let eth_names = ethernet_names.clone();
     #[cfg(feature = "tashtalk")]
-    let tash_devices = tashtalk_devices;
+    let tash_devices = tashtalk_devices.clone();
 
     ui.on_start_stop(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
@@ -253,8 +258,7 @@ fn main() -> anyhow::Result<()> {
                 // index 0 is "None"; devices start at 1
                 tash_idx
                     .checked_sub(1)
-                    .and_then(|i| tash_devices.get(i))
-                    .map(|d| d.path.clone())
+                    .and_then(|i| tash_devices.borrow().get(i).map(|d| d.path.clone()))
             };
 
             #[allow(unused_mut)]
@@ -323,6 +327,55 @@ fn main() -> anyhow::Result<()> {
             }
         });
     });
+
+    // Poll for serial device changes every 1.5 s so plug/unplug is reflected live.
+    #[cfg(feature = "tashtalk")]
+    let _serial_poll_timer = {
+        let ui_weak = ui.as_weak();
+        let poll_devices = tashtalk_devices.clone();
+        let poll_model = tash_model.clone();
+        let timer = slint::Timer::default();
+        timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(1500),
+            move || {
+                let new_devices = enumerate_serial();
+                let mut current = poll_devices.borrow_mut();
+                let changed = new_devices.len() != current.len()
+                    || new_devices
+                        .iter()
+                        .zip(current.iter())
+                        .any(|(a, b)| a.path != b.path);
+                if !changed {
+                    return;
+                }
+                // Remember which port was selected so we can re-select it.
+                let selected_path = {
+                    let Some(ui) = ui_weak.upgrade() else { return };
+                    let idx = ui.get_selected_tashtalk() as usize;
+                    idx.checked_sub(1)
+                        .and_then(|i| current.get(i).map(|d| d.path.clone()))
+                };
+                *current = new_devices;
+                // Rebuild model entries.
+                while poll_model.row_count() > 1 {
+                    poll_model.remove(poll_model.row_count() - 1);
+                }
+                for d in current.iter() {
+                    poll_model.push(SharedString::from(d.label.as_str()));
+                }
+                // Restore selection by path, fall back to "None".
+                let new_idx = selected_path
+                    .and_then(|p| current.iter().position(|d| d.path == p))
+                    .map(|i| (i + 1) as i32)
+                    .unwrap_or(0);
+                if let Some(ui) = ui_weak.upgrade() {
+                    ui.set_selected_tashtalk(new_idx);
+                }
+            },
+        );
+        timer
+    };
 
     ui.run()?;
     Ok(())
