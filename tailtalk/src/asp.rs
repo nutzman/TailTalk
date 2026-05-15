@@ -111,7 +111,7 @@ impl AspSession {
         // We just do one transaction, return the data, and let the AFP layer reply with the
         // actual bytes written. The client will issue a new FPWrite for the rest.
 
-        let chunk_size = req_count.min(1024);
+        let chunk_size = req_count.min(crate::atp::ATP_MAX_DATA_PER_PACKET * 8);
         let quantum = chunk_size as u16;
 
         let header = AspHeader {

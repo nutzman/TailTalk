@@ -1,4 +1,4 @@
-import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, GroupBox, HorizontalBox, VerticalBox, CheckBox } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
@@ -20,9 +20,12 @@ export component AppWindow inherits Window {
     in property <bool> feature-ethertalk: false;
     in property <bool> feature-tashtalk: false;
     in-out property <string> error-message: "";
+    in-out property <bool> pcap-enabled: false;
+    in-out property <string> pcap-path;
 
     callback start-stop();
     callback browse-volume();
+    callback browse-pcap();
 
     VerticalBox {
         padding: 12px;
@@ -61,6 +64,29 @@ export component AppWindow inherits Window {
                         current-index <=> root.selected-tashtalk;
                         horizontal-stretch: 1;
                         enabled: !root.running;
+                    }
+                }
+
+                if root.feature-tashtalk : HorizontalBox {
+                    Text { text: "Capture pcap:"; min-width: 140px; vertical-alignment: center; }
+                    CheckBox {
+                        checked <=> root.pcap-enabled;
+                        enabled: !root.running;
+                    }
+                }
+
+                if root.feature-tashtalk && root.pcap-enabled : HorizontalBox {
+                    Text { text: "pcap File:"; min-width: 140px; vertical-alignment: center; }
+                    LineEdit {
+                        text <=> root.pcap-path;
+                        placeholder-text: "Path to output .pcap file";
+                        horizontal-stretch: 1;
+                        enabled: !root.running;
+                    }
+                    Button {
+                        text: "Browse…";
+                        enabled: !root.running;
+                        clicked => { root.browse-pcap(); }
                     }
                 }
 

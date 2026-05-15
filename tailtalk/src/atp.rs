@@ -21,6 +21,8 @@ pub struct PendingRequestState {
     pub received_packets: std::collections::BTreeMap<u8, Vec<u8>>,
     pub user_bytes: Option<[u8; 4]>,
     pub eom_seq: Option<u8>,
+    pub raw_packet: Vec<u8>,
+    pub destination: AtpAddress,
 }
 
 type AtpTransactionMap = HashMap<u16, PendingRequestState>;
@@ -275,6 +277,9 @@ impl Atp {
     }
 
     async fn run(mut self) {
+        let mut retry_interval = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        retry_interval.tick().await; // skip the immediate first tick
+
         loop {
             tokio::select! {
                 sock_recv = self.sock.recv() => {
@@ -305,6 +310,35 @@ impl Atp {
                         break;
                     }
                 }
+                _ = retry_interval.tick() => {
+                    self.retransmit_pending().await;
+                }
+            }
+        }
+    }
+
+    async fn retransmit_pending(&mut self) {
+        if self.pending_transactions.is_empty() {
+            return;
+        }
+
+        let retransmits: Vec<(u16, Vec<u8>, AtpAddress)> = self.pending_transactions
+            .iter()
+            .map(|(tid, state)| (*tid, state.raw_packet.clone(), state.destination))
+            .collect();
+
+        for (tid, packet, dest_addr) in retransmits {
+            let dest = crate::ddp::DdpAddress::new(
+                tailtalk_packets::aarp::AppleTalkAddress {
+                    network_number: dest_addr.network_number,
+                    node_number: dest_addr.node_number,
+                },
+                dest_addr.socket_number,
+            );
+            if let Err(e) = self.sock.send_to(&packet, dest).await {
+                tracing::warn!("ATP retransmit failed for TID {}: {}", tid, e);
+            } else {
+                tracing::debug!("ATP retransmitting TID {}", tid);
             }
         }
     }
@@ -354,6 +388,8 @@ impl Atp {
             req.address.socket_number,
         );
 
+        let raw_packet = buf[..total_len].to_vec();
+
         if let Err(e) = self.sock.send_to(&buf[..total_len], dest).await {
             let _ = req.chan.send(Err(io::Error::other(e)));
         } else {
@@ -361,10 +397,12 @@ impl Atp {
                 tid,
                 PendingRequestState {
                     chan: req.chan,
-                    xo: true, // XO is always true for now
+                    xo: true,
                     received_packets: std::collections::BTreeMap::new(),
                     user_bytes: None,
                     eom_seq: None,
+                    raw_packet,
+                    destination: req.address,
                 },
             );
         }

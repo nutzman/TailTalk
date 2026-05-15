@@ -1,5 +1,6 @@
 use anyhow::Error;
 use mac_address::mac_address_by_name;
+use std::path::PathBuf;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
@@ -63,6 +64,8 @@ pub struct PacketProcessor {
     tashtalk: Option<TashTalk<tokio_serial::SerialStream>>,
     /// CRC features to set on the TashTalk firmware at startup.
     tashtalk_features: tashtalk::TashTalkFeatures,
+    /// Sender to the LocalTalk pcap writer thread, if capture is enabled.
+    pcap_sender: Option<std::sync::mpsc::SyncSender<(SystemTime, Vec<u8>)>>,
 }
 
 // ── Builder ───────────────────────────────────────────────────────────────────
@@ -102,6 +105,7 @@ pub struct PacketProcessorBuilder {
     ethernet_intf: Option<String>,
     localtalk_serial_path: Option<String>,
     tashtalk_features: tashtalk::TashTalkFeatures,
+    pcap_path: Option<PathBuf>,
 }
 
 impl PacketProcessorBuilder {
@@ -110,6 +114,7 @@ impl PacketProcessorBuilder {
             ethernet_intf: None,
             localtalk_serial_path: None,
             tashtalk_features: tashtalk::TashTalkFeatures::new(),
+            pcap_path: None,
         }
     }
 
@@ -136,6 +141,16 @@ impl PacketProcessorBuilder {
     /// `ddp` handles needed for that setup.
     pub fn localtalk(mut self, serial_path: &str) -> Self {
         self.localtalk_serial_path = Some(serial_path.to_string());
+        self
+    }
+
+    /// Enable LocalTalk pcap capture to the given file path.
+    ///
+    /// When set, every LocalTalk frame received from or sent to the TashTalk
+    /// device is written to a pcap file (DLT 114 / LINKTYPE_LOCALTALK).
+    /// Frames are written without the trailing CRC bytes.
+    pub fn pcap_capture(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pcap_path = Some(path.into());
         self
     }
 
@@ -190,6 +205,8 @@ impl PacketProcessorBuilder {
 
         let (outbound_tx, outbound_rx) = mpsc::channel(100);
 
+        let pcap_sender = self.pcap_path.and_then(spawn_pcap_writer);
+
         let processor = PacketProcessor {
             pcap_rx,
             pcap_tx,
@@ -197,11 +214,73 @@ impl PacketProcessorBuilder {
             our_mac,
             tashtalk,
             tashtalk_features: self.tashtalk_features,
+            pcap_sender,
         };
         let handle = OutboundHandle { tx: outbound_tx };
 
         Ok((processor, handle))
     }
+}
+
+// ── LocalTalk pcap writer ─────────────────────────────────────────────────────
+
+/// Spawn a background thread that writes LocalTalk frames to a pcap file.
+///
+/// Returns a `SyncSender` that the caller uses to submit `(timestamp, frame)`
+/// pairs. The thread exits when the sender is dropped (channel closed).
+/// Frames should not include the trailing 2-byte LocalTalk CRC.
+fn spawn_pcap_writer(
+    path: PathBuf,
+) -> Option<std::sync::mpsc::SyncSender<(SystemTime, Vec<u8>)>> {
+    use std::io::Write as _;
+
+    let mut file = match std::fs::File::create(&path).map(std::io::BufWriter::new) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::error!("Failed to create pcap file '{}': {e}", path.display());
+            return None;
+        }
+    };
+
+    // Classic pcap global header (little-endian, DLT 114 = LINKTYPE_LOCALTALK).
+    let mut hdr = [0u8; 24];
+    hdr[0..4].copy_from_slice(&0xa1b2c3d4u32.to_le_bytes()); // magic
+    hdr[4..6].copy_from_slice(&2u16.to_le_bytes());           // version major
+    hdr[6..8].copy_from_slice(&4u16.to_le_bytes());           // version minor
+    // thiszone and sigfigs remain 0
+    hdr[16..20].copy_from_slice(&65535u32.to_le_bytes());     // snaplen
+    hdr[20..24].copy_from_slice(&114u32.to_le_bytes());       // LINKTYPE_LOCALTALK
+
+    if let Err(e) = file.write_all(&hdr) {
+        tracing::error!("Failed to write pcap global header: {e}");
+        return None;
+    }
+
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(SystemTime, Vec<u8>)>(512);
+
+    std::thread::spawn(move || {
+        use std::io::Write as _;
+        tracing::info!("LocalTalk pcap capture started: '{}'", path.display());
+        for (ts, data) in rx {
+            let d = ts.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+            let ts_sec = d.as_secs() as u32;
+            let ts_usec = d.subsec_micros();
+            let len = data.len() as u32;
+            let mut rec = [0u8; 16];
+            rec[0..4].copy_from_slice(&ts_sec.to_le_bytes());
+            rec[4..8].copy_from_slice(&ts_usec.to_le_bytes());
+            rec[8..12].copy_from_slice(&len.to_le_bytes());
+            rec[12..16].copy_from_slice(&len.to_le_bytes());
+            if file.write_all(&rec).is_err() || file.write_all(&data).is_err() {
+                tracing::error!("pcap write error, stopping capture");
+                break;
+            }
+            let _ = file.flush();
+        }
+        tracing::info!("LocalTalk pcap capture stopped: '{}'", path.display());
+    });
+
+    Some(tx)
 }
 
 // ── PacketProcessor ───────────────────────────────────────────────────────────
@@ -218,6 +297,11 @@ impl PacketProcessor {
     }
 
     pub async fn run(self, addressing: addressing::AddressingHandle, ddp: ddp::DdpHandle, token: CancellationToken) {
+        // Extract pcap senders before any other field moves.
+        // pcap_rx_sender goes into the TashTalk receive task; pcap_tx_sender stays in the outbound loop.
+        let pcap_rx_sender = self.pcap_sender.clone();
+        let pcap_tx_sender = self.pcap_sender;
+
         // ── EtherTalk RX task ────────────────────────────────────────────────
         if let Some(rx_cap) = self.pcap_rx {
             let ddp_rx = ddp.clone();
@@ -404,6 +488,9 @@ impl PacketProcessor {
                             match res {
                                 Ok(Some(data)) => {
                                     last_receive_was_error = false;
+                                    if let Some(ref tx) = pcap_rx_sender {
+                                        let _ = tx.try_send((SystemTime::now(), data.clone()));
+                                    }
                                     if data.len() < 3 { continue; }
                                     if let Ok(llap) = LlapPacket::parse(&data) {
                                         match llap.type_ {
@@ -594,6 +681,11 @@ impl PacketProcessor {
                             tracing::error!("Failed to send to Tashtalk tx: {}", e);
                         }
                     }
+                    // Capture outbound frame without the trailing 2 CRC bytes.
+                    if let Some(ref tx) = pcap_tx_sender {
+                        let frame_len = final_size.saturating_sub(2);
+                        let _ = tx.try_send((SystemTime::now(), output_buf[..frame_len].to_vec()));
+                    }
                 }
             }
         }
@@ -685,6 +777,7 @@ pub struct TalkStackBuilder {
     localtalk_serial_path: Option<String>,
     tashtalk_features: tashtalk::TashTalkFeatures,
     fixed_addr: Option<tailtalk_packets::aarp::AppleTalkAddress>,
+    pcap_path: Option<PathBuf>,
 }
 
 impl TalkStack {
@@ -694,6 +787,7 @@ impl TalkStack {
             localtalk_serial_path: None,
             tashtalk_features: tashtalk::TashTalkFeatures::new(),
             fixed_addr: None,
+            pcap_path: None,
         }
     }
 }
@@ -717,6 +811,14 @@ impl TalkStackBuilder {
         self
     }
 
+    /// Enable LocalTalk pcap capture to the given file path.
+    ///
+    /// Forwarded to [`PacketProcessorBuilder::pcap_capture`].
+    pub fn pcap_capture(mut self, path: impl Into<PathBuf>) -> Self {
+        self.pcap_path = Some(path.into());
+        self
+    }
+
     /// Use a fixed AppleTalk address instead of probing via AARP.
     pub fn fixed_address(mut self, network: u16, node: u8) -> Self {
         self.fixed_addr = Some(tailtalk_packets::aarp::AppleTalkAddress {
@@ -737,6 +839,9 @@ impl TalkStackBuilder {
         }
         if let Some(ref path) = self.localtalk_serial_path {
             pp = pp.localtalk(path);
+        }
+        if let Some(path) = self.pcap_path {
+            pp = pp.pcap_capture(path);
         }
         let (processor, outbound) = pp.build()?;
 

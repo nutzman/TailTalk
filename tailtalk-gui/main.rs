@@ -28,6 +28,8 @@ struct AppConfig {
     // Stored as the port path string so it survives device re-enumeration.
     tashtalk_port: Option<String>,
     ethernet_interface: Option<String>,
+    pcap_enabled: bool,
+    pcap_path: Option<String>,
 }
 
 fn config_path() -> Option<PathBuf> {
@@ -62,6 +64,7 @@ enum ServerCommand {
         #[cfg(feature = "tashtalk")]
         tashtalk: Option<String>,
         volume: PathBuf,
+        pcap_path: Option<PathBuf>,
     },
     Stop,
 }
@@ -222,6 +225,10 @@ fn main() -> anyhow::Result<()> {
                 ui.set_selected_tashtalk((idx + 1) as i32);
             }
         }
+        ui.set_pcap_enabled(config.pcap_enabled);
+        if let Some(ref path) = config.pcap_path {
+            ui.set_pcap_path(path.as_str().into());
+        }
     }
 
     let ui_handle = ui.as_weak();
@@ -298,7 +305,19 @@ fn main() -> anyhow::Result<()> {
                     #[cfg(not(feature = "ethertalk"))]
                     { None }
                 },
+                pcap_enabled: ui.get_pcap_enabled(),
+                pcap_path: {
+                    let s = ui.get_pcap_path().to_string();
+                    if s.is_empty() { None } else { Some(s) }
+                },
             });
+
+            let pcap_path: Option<PathBuf> = if ui.get_pcap_enabled() {
+                let s = ui.get_pcap_path().to_string();
+                if s.is_empty() { None } else { Some(PathBuf::from(s)) }
+            } else {
+                None
+            };
 
             let _ = cmd_tx.try_send(ServerCommand::Start {
                 server_name: ui.get_server_name().to_string(),
@@ -308,6 +327,7 @@ fn main() -> anyhow::Result<()> {
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
                 volume,
+                pcap_path,
             });
         }
     });
@@ -321,6 +341,26 @@ fn main() -> anyhow::Result<()> {
                 slint::invoke_from_event_loop(move || {
                     if let Some(ui) = ui_weak.upgrade() {
                         ui.set_volume_path(path_str);
+                    }
+                })
+                .ok();
+            }
+        });
+    });
+
+    let ui_weak = ui.as_weak();
+    ui.on_browse_pcap(move || {
+        let ui_weak = ui_weak.clone();
+        std::thread::spawn(move || {
+            if let Some(path) = rfd::FileDialog::new()
+                .add_filter("pcap capture", &["pcap"])
+                .set_file_name("tailtalk_capture.pcap")
+                .save_file()
+            {
+                let path_str: slint::SharedString = path.to_string_lossy().into_owned().into();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_pcap_path(path_str);
                     }
                 })
                 .ok();
@@ -399,6 +439,7 @@ async fn server_loop(
                 #[cfg(feature = "tashtalk")]
                 tashtalk,
                 volume,
+                pcap_path,
             } => {
                 if let Some(h) = shutdown_handle.take() {
                     h.shutdown();
@@ -414,6 +455,7 @@ async fn server_loop(
                     #[cfg(feature = "tashtalk")]
                     tashtalk,
                     volume,
+                    pcap_path,
                     ready_tx,
                     ui_w.clone(),
                 ));
@@ -469,6 +511,7 @@ async fn run_server(
     #[cfg(feature = "ethertalk")] ethernet: Option<String>,
     #[cfg(feature = "tashtalk")] tashtalk: Option<String>,
     volume: PathBuf,
+    pcap_path: Option<PathBuf>,
     ready_tx: tokio::sync::oneshot::Sender<ShutdownHandle>,
     ui_weak: slint::Weak<AppWindow>,
 ) {
@@ -492,6 +535,10 @@ async fn run_server(
     #[cfg(feature = "ethertalk")]
     if let Some(ref intf) = ethernet {
         stack_builder = stack_builder.ethernet(intf);
+    }
+
+    if let Some(path) = pcap_path {
+        stack_builder = stack_builder.pcap_capture(path);
     }
 
     #[cfg(feature = "tashtalk")]
