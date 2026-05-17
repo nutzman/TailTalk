@@ -10,14 +10,19 @@ use tailtalk_packets::afp::{
 
 use crate::time_to_afp_v1;
 use tracing::{error, info};
+#[cfg(unix)]
 use xattr;
 
 /// Extended attribute name for the 32-byte Finder Info blob.
 /// macOS uses no namespace prefix; Linux requires the "user." namespace.
+/// On Windows we use an NTFS Alternate Data Stream instead (no xattr crate needed).
 #[cfg(target_os = "macos")]
 const FINDER_INFO_XATTR: &str = "com.apple.FinderInfo";
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 const FINDER_INFO_XATTR: &str = "user.com.apple.FinderInfo";
+/// ADS stream name appended to the file path as "path:com.apple.FinderInfo".
+#[cfg(windows)]
+const FINDER_INFO_STREAM: &str = "com.apple.FinderInfo";
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -69,29 +74,52 @@ impl Node {
         }
     }
 
-    /// Read Finder Info from the platform xattr.
+    /// Read Finder Info from the platform-native metadata store.
     pub fn get_finder_info(&self, volume_root: &Path) -> [u8; 32] {
         let absolute_path = volume_root.join(&self.path);
-        match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
-            Ok(Some(data)) => {
-                let mut info = [0u8; 32];
-                if data.len() >= 32 {
+        #[cfg(unix)]
+        {
+            match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
+                Ok(Some(data)) if data.len() >= 32 => {
+                    let mut info = [0u8; 32];
                     info.copy_from_slice(&data[0..32]);
+                    info
                 }
-                info
+                _ => [0u8; 32],
             }
-            Ok(None) => [0u8; 32],
-            Err(_) => [0u8; 32],
+        }
+        #[cfg(windows)]
+        {
+            let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
+            match std::fs::read(&stream_path) {
+                Ok(data) if data.len() >= 32 => {
+                    let mut info = [0u8; 32];
+                    info.copy_from_slice(&data[0..32]);
+                    info
+                }
+                _ => [0u8; 32],
+            }
         }
     }
 
-    /// Write Finder Info to the platform xattr.
+    /// Write Finder Info to the platform-native metadata store.
     pub fn set_finder_info(&self, volume_root: &Path, info: &[u8; 32]) -> Result<(), AfpError> {
         let absolute_path = volume_root.join(&self.path);
-        xattr::set(&absolute_path, FINDER_INFO_XATTR, info).map_err(|e| {
-            error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
-            AfpError::AccessDenied
-        })
+        #[cfg(unix)]
+        {
+            xattr::set(&absolute_path, FINDER_INFO_XATTR, info).map_err(|e| {
+                error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
+                AfpError::AccessDenied
+            })
+        }
+        #[cfg(windows)]
+        {
+            let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
+            std::fs::write(&stream_path, info).map_err(|e| {
+                error!("Failed to set Finder Info for {:?}: {:?}", self.path, e);
+                AfpError::AccessDenied
+            })
+        }
     }
 
     /// Get AFP file/dir attributes derived from the Finder Info xattr.
@@ -1850,6 +1878,22 @@ impl Volume {
             error!("copy_file {:?} → {:?}: {:?}", src_absolute, dst_absolute, e);
             AfpError::AccessDenied
         })?;
+
+        // tokio::fs::copy doesn't carry metadata — copy it explicitly per platform.
+        #[cfg(all(unix, not(target_os = "macos")))]
+        for attr in xattr::list(&src_absolute).into_iter().flatten() {
+            if let Ok(Some(val)) = xattr::get(&src_absolute, &attr) {
+                let _ = xattr::set(&dst_absolute, &attr, &val);
+            }
+        }
+        #[cfg(windows)]
+        {
+            let src_stream = format!("{}:{}", src_absolute.display(), FINDER_INFO_STREAM);
+            let dst_stream = format!("{}:{}", dst_absolute.display(), FINDER_INFO_STREAM);
+            if let Ok(data) = std::fs::read(&src_stream) {
+                let _ = std::fs::write(&dst_stream, &data);
+            }
+        }
 
         // Copy resource fork sidecar if it exists.
         let src_sidecar = rsrc_path(&self.path, &src_relative);

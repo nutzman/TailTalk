@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(any(feature = "ethertalk", feature = "tashtalk"))]
 use std::rc::Rc;
@@ -368,6 +368,49 @@ fn main() -> anyhow::Result<()> {
         });
     });
 
+    let ui_weak = ui.as_weak();
+    ui.on_import_stuffit(move || {
+        let ui_weak = ui_weak.clone();
+
+        let (volume_path, is_running) = {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            (PathBuf::from(ui.get_volume_path().as_str()), ui.get_running())
+        };
+
+        if is_running {
+            show_error(
+                ui_weak,
+                "Please stop the AFP server before importing an archive.\n\
+                 Importing while the server is running may corrupt the desktop database."
+                    .to_string(),
+            );
+            return;
+        }
+
+        if volume_path.as_os_str().is_empty() {
+            show_error(ui_weak, "Please set a volume path before importing.".to_string());
+            return;
+        }
+
+        std::thread::spawn(move || {
+            let Some(sit_path) = rfd::FileDialog::new()
+                .add_filter("StuffIt Archive", &["sit"])
+                .set_title("Import StuffIt Archive")
+                .pick_file()
+            else {
+                return;
+            };
+
+            match extract_sit(&sit_path, &volume_path) {
+                Ok(count) => show_info(
+                    ui_weak,
+                    format!("Extracted {count} file(s) from the archive successfully."),
+                ),
+                Err(e) => show_error(ui_weak, e),
+            }
+        });
+    });
+
     // Poll for serial device changes every 1.5 s so plug/unplug is reflected live.
     #[cfg(feature = "tashtalk")]
     let _serial_poll_timer = {
@@ -500,6 +543,466 @@ fn show_error(ui_weak: slint::Weak<AppWindow>, message: String) {
         }
     })
     .ok();
+}
+
+fn show_info(ui_weak: slint::Weak<AppWindow>, message: String) {
+    slint::invoke_from_event_loop(move || {
+        if let Some(ui) = ui_weak.upgrade() {
+            ui.set_info_message(message.into());
+        }
+    })
+    .ok();
+}
+
+// ── Mac resource fork parsing ─────────────────────────────────────────────────
+
+/// Parse a Mac resource fork and return every (resource_type, data) pair found.
+///
+/// The resource fork binary layout (Inside Macintosh, Files chapter):
+///   [0..4]   offset to resource-data section from fork start
+///   [4..8]   offset to resource map from fork start
+///   [8..12]  length of resource-data section
+///   [12..16] length of resource map
+///
+/// Resource map at `map_off`:
+///   [24..26] offset to type list, relative to start of map
+///   [28..30] number of resource types - 1  (0xFFFF → 0 types)
+///
+/// Type-list layout (at map_off + type_list_off):
+///   [0..2]   num_types - 1 (duplicate of map[28..30])
+///   then for each type, 8 bytes:
+///     [0..4]  resource type (OSType)
+///     [4..6]  num_resources - 1
+///     [6..8]  offset of this type's reference list, from type-list start
+///
+/// Reference-list entries (12 bytes each):
+///   [0..2]  resource ID
+///   [2..4]  name-list offset (0xFFFF = no name)
+///   [4]     attributes
+///   [5..8]  3-byte big-endian offset into resource-data section
+///   [8..12] reserved
+///
+#[derive(Debug, Clone)]
+struct Resource {
+    res_type: [u8; 4],
+    id: i16,
+    data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BndlMapping {
+    local_id: u16,
+    res_id: u16,
+}
+
+#[derive(Debug, Clone)]
+struct BndlTypeArray {
+    res_type: [u8; 4],
+    mappings: Vec<BndlMapping>,
+}
+
+#[derive(Debug, Clone)]
+struct Bndl {
+    creator: [u8; 4],
+    type_arrays: Vec<BndlTypeArray>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Fref {
+    file_type: [u8; 4],
+    local_icon_id: u16,
+}
+
+/// Parse a Mac resource fork, returning every resource it contains.
+fn parse_resource_fork(fork: &[u8]) -> Vec<Resource> {
+    let Some(b) = fork.get(0..4) else { return vec![] };
+    let data_section_off = u32::from_be_bytes(b.try_into().unwrap()) as usize;
+    let Some(b) = fork.get(4..8) else { return vec![] };
+    let map_off = u32::from_be_bytes(b.try_into().unwrap()) as usize;
+    let Some(b) = fork.get(map_off + 24..map_off + 26) else { return vec![] };
+    let type_list_off_in_map = u16::from_be_bytes(b.try_into().unwrap()) as usize;
+    let Some(b) = fork.get(map_off + 28..map_off + 30) else { return vec![] };
+    let num_types_raw = u16::from_be_bytes(b.try_into().unwrap());
+    if num_types_raw == 0xFFFF {
+        return vec![];
+    }
+    let num_types = num_types_raw as usize + 1;
+
+    let type_list_abs = map_off + type_list_off_in_map;
+    let type_entries_abs = type_list_abs + 2;
+    let mut out = Vec::new();
+
+    for i in 0..num_types {
+        let te = type_entries_abs + i * 8;
+        let Some(entry) = fork.get(te..te + 8) else { break };
+        let res_type: [u8; 4] = entry[0..4].try_into().unwrap();
+        let count_raw = u16::from_be_bytes([entry[4], entry[5]]);
+        if count_raw == 0xFFFF {
+            continue;
+        }
+        let count = count_raw as usize + 1;
+        let ref_list_abs = type_list_abs + u16::from_be_bytes([entry[6], entry[7]]) as usize;
+
+        for j in 0..count {
+            let re = ref_list_abs + j * 12;
+            let Some(ref_entry) = fork.get(re..re + 12) else { break };
+            let id = i16::from_be_bytes([ref_entry[0], ref_entry[1]]);
+            let data_off = ((ref_entry[5] as u32) << 16)
+                | ((ref_entry[6] as u32) << 8)
+                | (ref_entry[7] as u32);
+            let abs = data_section_off + data_off as usize;
+            let Some(len_bytes) = fork.get(abs..abs + 4) else { continue };
+            let res_len = u32::from_be_bytes(len_bytes.try_into().unwrap()) as usize;
+            let start = abs + 4;
+            let Some(data) = fork.get(start..start + res_len) else { continue };
+            out.push(Resource { res_type, id, data: data.to_vec() });
+        }
+    }
+    out
+}
+
+/// Parse a `'BNDL'` resource.
+fn parse_bndl(data: &[u8]) -> Option<Bndl> {
+    let creator: [u8; 4] = data.get(0..4)?.try_into().ok()?;
+    // data[4..6] is the bundle version, always 0 — skip.
+    let num_type_arrays =
+        u16::from_be_bytes(data.get(6..8)?.try_into().ok()?) as usize + 1;
+
+    let mut pos = 8;
+    let mut type_arrays = Vec::new();
+
+    for _ in 0..num_type_arrays {
+        let Some(header) = data.get(pos..pos + 6) else { break };
+        let res_type: [u8; 4] = header[0..4].try_into().unwrap();
+        let num_entries = u16::from_be_bytes([header[4], header[5]]) as usize + 1;
+        pos += 6;
+
+        let mut mappings = Vec::new();
+        for _ in 0..num_entries {
+            let Some(e) = data.get(pos..pos + 4) else { break };
+            mappings.push(BndlMapping {
+                local_id: u16::from_be_bytes([e[0], e[1]]),
+                res_id: u16::from_be_bytes([e[2], e[3]]),
+            });
+            pos += 4;
+        }
+
+        type_arrays.push(BndlTypeArray { res_type, mappings });
+    }
+
+    Some(Bndl { creator, type_arrays })
+}
+
+impl TryFrom<&[u8]> for Fref {
+    type Error = ();
+    fn try_from(data: &[u8]) -> Result<Self, ()> {
+        (|| Some(Self {
+            file_type: data.get(0..4)?.try_into().ok()?,
+            local_icon_id: u16::from_be_bytes(data.get(4..6)?.try_into().ok()?),
+        }))().ok_or(())
+    }
+}
+
+/// AFP icon type byte used in FPAddIcon/FPGetIcon, keyed by Mac resource type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum AfpIconType {
+    Icn32,  // ICN# — 32×32 1-bit icon + mask
+    Ics16,  // ics# — 16×16 1-bit icon + mask
+    Icl4,   // icl4 — 32×32 4-bit colour
+    Ics4,   // ics4 — 16×16 4-bit colour
+    Icl8,   // icl8 — 32×32 8-bit colour
+    Ics8,   // ics8 — 16×16 8-bit colour
+}
+
+impl TryFrom<&[u8; 4]> for AfpIconType {
+    type Error = ();
+    fn try_from(res_type: &[u8; 4]) -> Result<Self, ()> {
+        match res_type {
+            b"ICN#" => Ok(Self::Icn32),
+            b"ics#" => Ok(Self::Ics16),
+            b"icl4" => Ok(Self::Icl4),
+            b"ics4" => Ok(Self::Ics4),
+            b"icl8" => Ok(Self::Icl8),
+            b"ics8" => Ok(Self::Ics8),
+            _ => Err(()),
+        }
+    }
+}
+
+impl From<AfpIconType> for u8 {
+    fn from(t: AfpIconType) -> u8 {
+        match t {
+            AfpIconType::Icn32 => 1,
+            AfpIconType::Ics16 => 2,
+            AfpIconType::Icl4  => 3,
+            AfpIconType::Ics4  => 4,
+            AfpIconType::Icl8  => 5,
+            AfpIconType::Ics8  => 6,
+        }
+    }
+}
+
+impl AfpIconType {
+    fn res_type(self) -> [u8; 4] {
+        match self {
+            Self::Icn32 => *b"ICN#",
+            Self::Ics16 => *b"ics#",
+            Self::Icl4  => *b"icl4",
+            Self::Ics4  => *b"ics4",
+            Self::Icl8  => *b"icl8",
+            Self::Ics8  => *b"ics8",
+        }
+    }
+}
+
+/// Extract just the creator code from a resource fork's `'BNDL'` resource,
+/// without opening the database.  Returns `None` if no BNDL is present.
+fn extract_bndl_creator(fork: &[u8]) -> Option<[u8; 4]> {
+    parse_resource_fork(fork)
+        .into_iter()
+        .find(|r| &r.res_type == b"BNDL")
+        .and_then(|r| parse_bndl(&r.data))
+        .map(|b| b.creator)
+}
+
+/// Store the icon resources from an `"Icon\r"` resource fork in the desktop database.
+///
+/// `creator` should be the actual application creator code found via `'BNDL'`
+/// in the same directory, so that `FPGetIcon` lookups match.
+fn load_icon_rsrc_into_desktop_db(
+    rsrc_fork: &[u8],
+    creator: [u8; 4],
+    volume_root: &Path,
+) -> Result<(), String> {
+    use tailtalk::afp::DesktopDatabase;
+
+    let db = DesktopDatabase::new(volume_root, 0)
+        .map_err(|e| format!("Failed to open desktop database: {e:?}"))?;
+
+    let resources = parse_resource_fork(rsrc_fork);
+    let mut stored = 0usize;
+
+    for r in &resources {
+        if let Ok(icon_type) = AfpIconType::try_from(&r.res_type) {
+            db.add_icon(creator, *b"fold", icon_type.into(), &r.data)
+                .map_err(|e| format!("Failed to store icon resource: {e:?}"))?;
+            stored += 1;
+        }
+    }
+
+    let creator_display: String = creator
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '·' })
+        .collect();
+    tracing::info!(
+        "Loaded {stored} icon resource(s) from Icon\\r into desktop database \
+         (creator={creator_display:?} ({:#010x}))",
+        u32::from_be_bytes(creator),
+    );
+    Ok(())
+}
+
+/// If the resource fork contains a `'BNDL'` resource, register the application
+/// and all of its file-type icons in the desktop database.
+///
+/// Does nothing (returns `Ok(())`) when no `'BNDL'` is present so the caller
+/// can unconditionally call this for every extracted file.
+fn register_appl_from_resource_fork(
+    rsrc_fork: &[u8],
+    rel_path: &Path,
+    volume_root: &Path,
+) -> Result<(), String> {
+    use std::collections::HashMap;
+    use tailtalk::afp::DesktopDatabase;
+
+    let resources = parse_resource_fork(rsrc_fork);
+
+    // Find the 'BNDL' resource (ID 128 is canonical, but accept any).
+    let bndl_data = match resources.iter().find(|r| &r.res_type == b"BNDL") {
+        Some(r) => r.data.clone(),
+        None => return Ok(()),
+    };
+
+    let Bndl { creator, type_arrays } = match parse_bndl(&bndl_data) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let db = DesktopDatabase::new(volume_root, 0)
+        .map_err(|e| format!("Failed to open desktop database: {e:?}"))?;
+
+    // Register the application itself.
+    // directory_id=2 is the AFP volume root; path uses ':' as AFP path separator.
+    let afp_path = rel_path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":");
+    db.add_appl(creator, 0, 2, &afp_path)
+        .map_err(|e| format!("Failed to register APPL in desktop database: {e:?}"))?;
+
+    // Build a flat resource lookup: (type, id) → &data
+    let res_lookup: HashMap<([u8; 4], i16), &Vec<u8>> = resources
+        .iter()
+        .map(|r| ((r.res_type, r.id), &r.data))
+        .collect();
+
+    // Separate the BNDL arrays by role.
+    // fref_entries: (local_id → FREF resource_id)
+    // icon_entries: icon_res_type → (local_id → icon resource_id)
+    let mut fref_entries: Vec<BndlMapping> = Vec::new();
+    let mut icon_entries: HashMap<AfpIconType, HashMap<u16, u16>> = HashMap::new();
+
+    for ta in &type_arrays {
+        if &ta.res_type == b"FREF" {
+            fref_entries = ta.mappings.clone();
+        } else if let Ok(icon_type) = AfpIconType::try_from(&ta.res_type) {
+            let by_local: HashMap<u16, u16> =
+                ta.mappings.iter().map(|m| (m.local_id, m.res_id)).collect();
+            icon_entries.insert(icon_type, by_local);
+        }
+    }
+
+    // For each FREF entry: resolve the file type and its matching icon resources.
+    let mut icons_stored = 0usize;
+    for fref_mapping in &fref_entries {
+        let Some(fref_data) = res_lookup.get(&(*b"FREF", fref_mapping.res_id as i16)) else {
+            continue;
+        };
+        let Ok(Fref { file_type, local_icon_id }) = Fref::try_from(fref_data.as_slice()) else {
+            continue;
+        };
+
+        for (icon_type, local_to_res) in &icon_entries {
+            let Some(&icon_res_id) = local_to_res.get(&local_icon_id) else { continue };
+            let Some(icon_data) = res_lookup.get(&(icon_type.res_type(), icon_res_id as i16))
+            else {
+                continue;
+            };
+            let _ = db.add_icon(creator, file_type, u8::from(*icon_type), icon_data);
+            icons_stored += 1;
+        }
+    }
+
+    let creator_display: String = creator
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() { b as char } else { '·' })
+        .collect();
+    tracing::info!(
+        "Registered APPL creator={creator_display:?} ({:#010x}) path={afp_path:?} \
+         with {icons_stored} icon(s)",
+        u32::from_be_bytes(creator),
+    );
+    Ok(())
+}
+
+// ── StuffIt extraction ────────────────────────────────────────────────────────
+
+/// Extract a StuffIt archive into `volume_path`, placing resource fork sidecars
+/// under `<volume_path>/.tailtalk/rsrc/<relative_path>` to match TailTalk's layout.
+fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
+    let bytes = std::fs::read(sit_path)
+        .map_err(|e| format!("Failed to read archive: {e}"))?;
+
+    let archive = stuffit::SitArchive::parse(&bytes)
+        .map_err(|e| format!("Failed to parse StuffIt archive: {e}"))?;
+
+    // directory (relative) → creator code found via BNDL in that directory
+    let mut dir_creators: std::collections::HashMap<PathBuf, [u8; 4]> =
+        std::collections::HashMap::new();
+    // Icon\r entries whose DB load is deferred until we have the creator map
+    let mut deferred_icon_cr: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+
+    let mut file_count = 0usize;
+
+    for entry in &archive.entries {
+        // Build a sanitized relative path: skip empty/`.`/`..` components.
+        let rel: PathBuf = entry.name
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != "." && *c != "..")
+            .collect();
+
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+
+        if entry.is_folder {
+            std::fs::create_dir_all(volume_path.join(&rel))
+                .map_err(|e| format!("Failed to create '{}': {e}", rel.display()))?;
+            continue;
+        }
+
+        // Ensure parent directory exists in the volume.
+        if let Some(parent) = rel.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(volume_path.join(parent))
+                .map_err(|e| format!("Failed to create parent for '{}': {e}", rel.display()))?;
+        }
+
+        let (data_fork, rsrc_fork) = entry
+            .decompressed_forks()
+            .map_err(|e| format!("Failed to decompress '{}': {e}", entry.name))?;
+
+        // Always create the data fork file, even when empty, so that AFP can
+        // serve the resource fork sidecar for resource-only files (e.g. apps).
+        let dest = volume_path.join(&rel);
+        std::fs::write(&dest, &data_fork)
+            .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
+        file_count += 1;
+
+        if !rsrc_fork.is_empty() {
+            let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&rel);
+            if let Some(parent) = rsrc_dest.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create rsrc dir for '{}': {e}", rel.display()))?;
+            }
+            std::fs::write(&rsrc_dest, &rsrc_fork)
+                .map_err(|e| format!("Failed to write resource fork for '{}': {e}", rel.display()))?;
+
+            let file_name = rel.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+            if file_name == "Icon\r" {
+                // Defer: we may not have seen the BNDL for this directory yet.
+                let parent_dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+                deferred_icon_cr.push((parent_dir, rsrc_fork));
+            } else {
+                // Register application + icons if a BNDL is present; also
+                // record the creator so Icon\r entries in the same dir can use it.
+                if let Some(creator) = extract_bndl_creator(&rsrc_fork) {
+                    let parent_dir = rel.parent().unwrap_or(Path::new("")).to_path_buf();
+                    dir_creators.entry(parent_dir).or_insert(creator);
+                }
+                if let Err(e) =
+                    register_appl_from_resource_fork(&rsrc_fork, &rel, volume_path)
+                {
+                    tracing::warn!("Could not register APPL for '{}': {e}", rel.display());
+                }
+            }
+        }
+    }
+
+    // Process deferred Icon\r entries now that we have the full creator map.
+    for (parent_dir, rsrc_fork) in &deferred_icon_cr {
+        // Use the real creator from a BNDL in the same directory if available.
+        let creator = dir_creators.get(parent_dir).copied().unwrap_or_else(|| {
+            // Fallback: derive from the folder name (space-padded to 4 bytes).
+            let folder_name = parent_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let mut c = [b' '; 4];
+            for (dst, src) in c.iter_mut().zip(folder_name.bytes()) {
+                *dst = src;
+            }
+            c
+        });
+        if let Err(e) = load_icon_rsrc_into_desktop_db(rsrc_fork, creator, volume_path) {
+            tracing::warn!("Could not load Icon\\r into desktop db: {e}");
+        }
+    }
+
+    Ok(file_count)
 }
 
 // ── AFP server task ───────────────────────────────────────────────────────────
