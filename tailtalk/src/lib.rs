@@ -1,5 +1,6 @@
 use anyhow::Error;
 use mac_address::mac_address_by_name;
+use rand::Rng;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use tailtalk_packets::aarp;
@@ -845,8 +846,23 @@ impl TalkStackBuilder {
         }
         let (processor, outbound) = pp.build()?;
 
+        // On LocalTalk-only setups, short DDP carries no network number (implying 0).
+        // If we let AARP pick network 1, NBP advertises net 1 but packets appear as
+        // net 0 — clients reject server-initiated requests (WriteContinue) due to the
+        // mismatch. Force network 0 so the address is consistent end-to-end.
+        let fixed_addr = if self.fixed_addr.is_some() {
+            self.fixed_addr
+        } else if self.ethernet_intf.is_none() && self.localtalk_serial_path.is_some() {
+            Some(tailtalk_packets::aarp::AppleTalkAddress {
+                network_number: 0,
+                node_number: rand::rng().random_range(1..=253u8),
+            })
+        } else {
+            None
+        };
+
         let mac = processor.get_mac().unwrap_or([0u8; 6]);
-        let addressing = addressing::Addressing::spawn(mac, outbound.clone(), self.fixed_addr);
+        let addressing = addressing::Addressing::spawn(mac, outbound.clone(), fixed_addr);
         let ddp = ddp::DdpProcessor::spawn(addressing.clone(), outbound);
         let echo = echo::Echo::spawn(&ddp).await;
         let nbp = nbp::Nbp::spawn(&ddp, addressing.clone()).await;

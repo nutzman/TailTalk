@@ -67,6 +67,8 @@ impl AspHandle {
 // Session state: SessionID -> AspSession (Internal State tracking)
 struct AspState {
     addr: crate::atp::AtpAddress,
+    /// Fixed socket from OpenSess — used for server-initiated messages (Tickle, WriteContinue).
+    session_addr: crate::atp::AtpAddress,
     #[allow(dead_code)]
     match_addr_only: bool, // For future strict checking
     // Channel to send commands to the session owner
@@ -79,6 +81,8 @@ struct AspState {
 pub struct AspSession {
     pub id: u8,
     pub remote_addr: crate::atp::AtpAddress,
+    /// Fixed socket from OpenSess — server-initiated requests (WriteContinue) go here.
+    session_addr: crate::atp::AtpAddress,
     command_rx: mpsc::Receiver<AspCommand>,
     atp_req: crate::atp::AtpRequestor,
 }
@@ -138,7 +142,7 @@ impl AspSession {
         // Send ATP Request
         let (response_data, _response_user_bytes) = self
             .atp_req
-            .send_request(self.remote_addr, user_bytes, data)
+            .send_request(self.session_addr, user_bytes, data)
             .await?;
 
         Ok(response_data)
@@ -219,10 +223,21 @@ impl Asp {
                                     next_session_id + 1
                                 };
 
+                                // user_bytes[1] of OpenSess is the client's CSS (Client Session
+                                // Socket) — the fixed socket where the client wants to receive
+                                // server-initiated messages (WriteContinue, Tickle). This is NOT
+                                // the source socket of this TReq (which is a dynamic socket).
+                                let client_css = crate::atp::AtpAddress {
+                                    network_number: req.source.network_number,
+                                    node_number: req.source.node_number,
+                                    socket_number: header.session_id,
+                                };
+
                                 tracing::info!(
-                                    "ASP Opening Session {} for client {:?}",
+                                    "ASP Opening Session {} for client {:?}, CSS={:?}",
                                     session_id,
-                                    req.source
+                                    req.source,
+                                    client_css,
                                 );
 
                                 // Create command channel for this session
@@ -232,6 +247,7 @@ impl Asp {
                                     session_id,
                                     AspState {
                                         addr: req.source,
+                                        session_addr: client_css,
                                         match_addr_only: true,
                                         command_tx,
                                         last_activity: tokio::time::Instant::now(),
@@ -242,6 +258,7 @@ impl Asp {
                                 let _ = acceptor.send(AspSession {
                                     id: session_id,
                                     remote_addr: req.source,
+                                    session_addr: client_css,
                                     command_rx,
                                     atp_req: atp_req_clone.clone(),
                                 });
@@ -409,7 +426,7 @@ impl Asp {
                                 0,
                                 0,
                             ];
-                            let _ = atp_req_clone.send_alo(sess.addr, user_bytes).await;
+                            let _ = atp_req_clone.send_alo(sess.session_addr, user_bytes).await;
                         }
 
                         for session_id in dead_sessions {

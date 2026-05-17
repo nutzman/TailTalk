@@ -446,11 +446,6 @@ impl Atp {
             }
         }
 
-        // Ensure next_tid is higher than any response TID we've used
-        // This maintains monotonic TID sequence across requests and responses
-        if resp.tid >= self.next_tid {
-            self.next_tid = resp.tid.wrapping_add(1);
-        }
     }
 
     async fn handle_send_alo(&mut self, alo: AtpSendAlo) {
@@ -532,11 +527,6 @@ impl Atp {
 
         match packet.function {
             AtpFunction::Request => {
-                // Ensure next_tid is higher than the request TID to maintain monotonic sequence
-                if packet.tid >= self.next_tid {
-                    self.next_tid = packet.tid.wrapping_add(1);
-                }
-
                 // Server-side: dispatch to responder
                 let request_data = if payload.len() > AtpPacket::HEADER_LEN {
                     payload[AtpPacket::HEADER_LEN..].to_vec()
