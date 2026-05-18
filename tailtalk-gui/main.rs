@@ -951,6 +951,15 @@ fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
             .map_err(|e| format!("Failed to write '{}': {e}", dest.display()))?;
         file_count += 1;
 
+        // Preserve the Mac file type and creator from the archive so that AFP
+        // reports correct FinderInfo (the Finder needs type=APPL to launch apps).
+        let mut finder_info = [0u8; 32];
+        finder_info[0..4].copy_from_slice(&entry.file_type);
+        finder_info[4..8].copy_from_slice(&entry.creator);
+        if let Err(e) = tailtalk::afp::write_finder_info(&dest, &finder_info) {
+            tracing::warn!("Could not set FinderInfo for '{}': {e}", rel.display());
+        }
+
         if !rsrc_fork.is_empty() {
             let rsrc_dest = volume_path.join(".tailtalk").join("rsrc").join(&rel);
             if let Some(parent) = rsrc_dest.parent() {

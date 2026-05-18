@@ -4,4 +4,4 @@ mod volume;
 
 pub use desktop::DesktopDatabase;
 pub use server::{AfpServer, AfpServerConfig};
-pub use volume::Volume;
+pub use volume::{write_finder_info, Volume};

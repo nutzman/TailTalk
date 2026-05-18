@@ -24,6 +24,21 @@ const FINDER_INFO_XATTR: &str = "user.com.apple.FinderInfo";
 #[cfg(windows)]
 const FINDER_INFO_STREAM: &str = "com.apple.FinderInfo";
 
+/// Write a 32-byte Finder Info blob directly to the platform-native metadata
+/// store for `path`.  The first 4 bytes are the file type, bytes 4–7 are the
+/// creator; the remainder may be zero.
+pub fn write_finder_info(path: &Path, info: &[u8; 32]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        xattr::set(path, FINDER_INFO_XATTR, info)
+    }
+    #[cfg(windows)]
+    {
+        let stream_path = format!("{}:{}", path.display(), FINDER_INFO_STREAM);
+        std::fs::write(&stream_path, info)
+    }
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct Node {
