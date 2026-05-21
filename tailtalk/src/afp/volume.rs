@@ -24,6 +24,25 @@ const FINDER_INFO_XATTR: &str = "user.com.apple.FinderInfo";
 #[cfg(windows)]
 const FINDER_INFO_STREAM: &str = "com.apple.FinderInfo";
 
+/// Classic Mac OS four-character type/creator codes for a file.
+struct TypeCreator {
+    file_type: [u8; 4],
+    creator: [u8; 4],
+}
+
+/// Returns the `TypeCreator` for a known file extension, or `None` if unrecognized.
+fn infer_type_creator(extension: &str) -> Option<TypeCreator> {
+    match extension.to_ascii_lowercase().as_str() {
+        // Disk Copy 4.2 disk images
+        "dsk" | "img" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
+        // StuffIt archives
+        "sit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
+        // Plain text files (SimpleText)
+        "txt" | "md" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
+        _ => None,
+    }
+}
+
 /// Write a 32-byte Finder Info blob directly to the platform-native metadata
 /// store for `path`.  The first 4 bytes are the file type, bytes 4–7 are the
 /// creator; the remainder may be zero.
@@ -90,31 +109,51 @@ impl Node {
     }
 
     /// Read Finder Info from the platform-native metadata store.
+    /// If no Finder Info exists for a file, attempts to infer type/creator from
+    /// the file extension and persists the result so future reads are consistent.
     pub fn get_finder_info(&self, volume_root: &Path) -> [u8; 32] {
         let absolute_path = volume_root.join(&self.path);
-        #[cfg(unix)]
-        {
-            match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
-                Ok(Some(data)) if data.len() >= 32 => {
-                    let mut info = [0u8; 32];
-                    info.copy_from_slice(&data[0..32]);
-                    info
+        let stored = {
+            #[cfg(unix)]
+            {
+                match xattr::get(&absolute_path, FINDER_INFO_XATTR) {
+                    Ok(Some(data)) if data.len() >= 32 => {
+                        let mut info = [0u8; 32];
+                        info.copy_from_slice(&data[0..32]);
+                        info
+                    }
+                    _ => [0u8; 32],
                 }
-                _ => [0u8; 32],
             }
-        }
-        #[cfg(windows)]
-        {
-            let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
-            match std::fs::read(&stream_path) {
-                Ok(data) if data.len() >= 32 => {
-                    let mut info = [0u8; 32];
-                    info.copy_from_slice(&data[0..32]);
-                    info
+            #[cfg(windows)]
+            {
+                let stream_path = format!("{}:{}", absolute_path.display(), FINDER_INFO_STREAM);
+                match std::fs::read(&stream_path) {
+                    Ok(data) if data.len() >= 32 => {
+                        let mut info = [0u8; 32];
+                        info.copy_from_slice(&data[0..32]);
+                        info
+                    }
+                    _ => [0u8; 32],
                 }
-                _ => [0u8; 32],
             }
+        };
+
+        if stored == [0u8; 32]
+            && !self.is_dir
+            && let Some(ext) = self.path.extension().and_then(|e| e.to_str())
+            && let Some(tc) = infer_type_creator(ext)
+        {
+            let mut inferred = [0u8; 32];
+            inferred[0..4].copy_from_slice(&tc.file_type);
+            inferred[4..8].copy_from_slice(&tc.creator);
+            if let Err(e) = write_finder_info(&absolute_path, &inferred) {
+                error!("Failed to persist inferred Finder Info for {:?}: {:?}", self.path, e);
+            }
+            return inferred;
         }
+
+        stored
     }
 
     /// Write Finder Info to the platform-native metadata store.

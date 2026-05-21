@@ -79,7 +79,6 @@ impl<T: AsyncRead + AsyncWrite + Unpin> TashTalk<T> {
     /// Note: if SetFeatures bit 7 (CRC Calculation) is enabled on TashTalk,
     /// it will overwrite the 2 CRC bytes with the correct values.
     pub async fn send_frame(&mut self, frame: &[u8]) -> Result<(), std::io::Error> {
-        tracing::info!("sending frame of len: {}", frame.len());
         self.framed
             .send(TashTalkCommand::TransmitFrame(frame.to_vec()))
             .await

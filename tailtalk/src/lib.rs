@@ -496,13 +496,13 @@ impl PacketProcessor {
                                     if let Ok(llap) = LlapPacket::parse(&data) {
                                         match llap.type_ {
                                             LlapType::DdpShort => {
-                                                tracing::info!("TashTalk: LocalTalk DDP Short");
+                                                tracing::debug!("TashTalk: LocalTalk DDP Short");
                                                 if let Ok(headers) = DdpPacket::parse_short(
                                                     &data[3..],
                                                     llap.dst_node,
                                                     llap.src_node,
                                                 ) {
-                                                    tracing::info!(
+                                                    tracing::debug!(
                                                         "LLAP: {:?}, DDP Short: {:?}",
                                                         llap,
                                                         headers
@@ -677,7 +677,7 @@ impl PacketProcessor {
                 }
                 addressing::Node::LocalTalk(_) => {
                     if let Some(tx) = &tashtalk_tx {
-                        tracing::info!("Sending to Tashtalk tx: {:X?}", &output_buf[..final_size]);
+                        tracing::debug!("Sending to Tashtalk tx: {:X?}", &output_buf[..final_size]);
                         if let Err(e) = tx.send(output_buf[..final_size].to_vec()).await {
                             tracing::error!("Failed to send to Tashtalk tx: {}", e);
                         }
@@ -716,12 +716,29 @@ impl OutboundHandle {
 /// A lightweight handle that can be used to shut down a running [`TalkStack`]
 /// from another task without holding the full stack.
 #[derive(Clone)]
-pub struct ShutdownHandle(CancellationToken);
+pub struct ShutdownHandle {
+    service_token: CancellationToken,
+    transport_token: CancellationToken,
+    services_done: CancellationToken,
+}
 
 impl ShutdownHandle {
-    /// Signal the stack to shut down all actors.
+    /// Force-stop everything immediately, with no graceful close.
     pub fn shutdown(&self) {
-        self.0.cancel();
+        self.service_token.cancel();
+        self.transport_token.cancel();
+    }
+
+    /// Close sessions gracefully (e.g. send ASP CloseSess), then stop the
+    /// transport once all services confirm they are done, or after 5 seconds.
+    pub async fn graceful_shutdown(&self) {
+        self.service_token.cancel();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            self.services_done.cancelled(),
+        )
+        .await;
+        self.transport_token.cancel();
     }
 }
 
@@ -737,7 +754,7 @@ impl ShutdownHandle {
 ///     .build()
 ///     .await?;
 ///
-/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default(), stack.token()).await?;
+/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default(), stack.token(), stack.services_done_token()).await?;
 /// # Ok(()) }
 /// ```
 pub struct TalkStack {
@@ -745,30 +762,41 @@ pub struct TalkStack {
     pub ddp: ddp::DdpHandle,
     pub nbp: nbp::NbpHandle,
     pub echo: echo::EchoHandle,
-    token: CancellationToken,
+    /// Cancelled to signal top-of-stack services (AFP, ASP) to begin shutdown.
+    service_token: CancellationToken,
+    /// Cancelled to stop the transport (DDP, PacketProcessor). Only done after
+    /// services have finished their cleanup.
+    transport_token: CancellationToken,
+    /// Cancelled by services once they have completed their shutdown sequence.
+    services_done: CancellationToken,
 }
 
 impl TalkStack {
-    /// Signal all stack actors to stop.
-    pub fn shutdown(&self) {
-        self.token.cancel();
-    }
-
-    /// Wait until [`shutdown`](Self::shutdown) has been called.
+    /// Wait until the transport has been shut down.
     pub async fn wait_for_shutdown(&self) {
-        self.token.cancelled().await;
+        self.transport_token.cancelled().await;
     }
 
     /// Return a [`ShutdownHandle`] that can be sent to another task to
     /// trigger shutdown remotely.
     pub fn shutdown_handle(&self) -> ShutdownHandle {
-        ShutdownHandle(self.token.clone())
+        ShutdownHandle {
+            service_token: self.service_token.clone(),
+            transport_token: self.transport_token.clone(),
+            services_done: self.services_done.clone(),
+        }
     }
 
-    /// Return a clone of the stack's cancellation token, suitable for passing
-    /// to sub-services such as [`AfpServer::spawn`](afp::AfpServer::spawn).
+    /// Return the service-layer cancellation token, suitable for passing to
+    /// sub-services such as [`AfpServer::spawn`](afp::AfpServer::spawn).
     pub fn token(&self) -> CancellationToken {
-        self.token.clone()
+        self.service_token.clone()
+    }
+
+    /// Return the services-done token to pass to services so they can signal
+    /// completion of their shutdown sequence.
+    pub fn services_done_token(&self) -> CancellationToken {
+        self.services_done.clone()
     }
 }
 
@@ -867,15 +895,17 @@ impl TalkStackBuilder {
         let echo = echo::Echo::spawn(&ddp).await;
         let nbp = nbp::Nbp::spawn(&ddp, addressing.clone()).await;
 
-        let token = CancellationToken::new();
-        tokio::spawn(processor.run(addressing.clone(), ddp.clone(), token.clone()));
+        let service_token = CancellationToken::new();
+        let transport_token = CancellationToken::new();
+        let services_done = CancellationToken::new();
+        tokio::spawn(processor.run(addressing.clone(), ddp.clone(), transport_token.clone()));
 
         // Wait until AARP has confirmed our node address before returning.
         // Without this, callers could attempt to send packets before addressing
         // is ready, especially when probing is required (no fixed address).
         addressing.addr().await?;
 
-        Ok(TalkStack { addressing, ddp, nbp, echo, token })
+        Ok(TalkStack { addressing, ddp, nbp, echo, service_token, transport_token, services_done })
     }
 }
 

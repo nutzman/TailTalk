@@ -2,8 +2,8 @@ use tailtalk::DataLinkProtocol;
 use std::sync::Arc;
 use std::time::Duration;
 use tailtalk::{
-    DataLinkPacket, OutboundHandle, addressing::Addressing, asp::Asp, atp::Atp, ddp::DdpProcessor,
-    echo::Echo, nbp::Nbp,
+    CancellationToken, DataLinkPacket, OutboundHandle, addressing::Addressing, asp::Asp, atp::Atp,
+    ddp::DdpProcessor, echo::Echo, nbp::Nbp,
 };
 use tailtalk_packets::{
     aarp::AddressSource,
@@ -217,6 +217,8 @@ async fn test_asp_session_workflow() {
         Some(205),
         "TestASP:AFPServer@*".try_into().unwrap(),
         status_data.clone(),
+        CancellationToken::new(),
+        CancellationToken::new(),
     )
     .await
     .expect("Failed to bind ASP");

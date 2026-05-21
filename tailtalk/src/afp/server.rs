@@ -83,6 +83,7 @@ impl AfpServer {
         socket: Option<u8>,
         config: AfpServerConfig,
         shutdown: CancellationToken,
+        services_done: CancellationToken,
     ) -> anyhow::Result<Self> {
         let config = Arc::new(config);
 
@@ -108,7 +109,7 @@ impl AfpServer {
         };
 
         // Bind ASP service
-        let asp_handle = Asp::bind(ddp, nbp, socket, entity_name, status_data).await?;
+        let asp_handle = Asp::bind(ddp, nbp, socket, entity_name, status_data, shutdown.clone(), services_done).await?;
 
         info!("AFP server '{}' started", config.server_name);
 

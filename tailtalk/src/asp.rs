@@ -1,6 +1,7 @@
 use crate::atp::Atp;
 use crate::ddp::DdpHandle;
 use crate::nbp::{NbpHandle, RegisteredName};
+use crate::CancellationToken;
 use anyhow::Result;
 use tailtalk_packets::asp::{AspHeader, SPFunction};
 use tailtalk_packets::nbp::EntityName;
@@ -156,6 +157,8 @@ impl Asp {
         socket_number: Option<u8>,
         entity_name: EntityName,
         status_data: Vec<u8>,
+        shutdown: CancellationToken,
+        services_done: CancellationToken,
     ) -> Result<AspHandle> {
         let (actual_socket, atp_req, mut atp_resp) = Atp::spawn(ddp, socket_number).await;
 
@@ -408,6 +411,25 @@ impl Asp {
                     }
                 }
                     } // end maybe_req arm
+
+                    // ── Graceful shutdown ────────────────────────────────────────
+                    _ = shutdown.cancelled() => {
+                        tracing::info!("ASP shutting down, closing {} active session(s)", sessions.len());
+                        for (session_id, sess) in &sessions {
+                            let user_bytes = [
+                                SPFunction::CloseSess as u8,
+                                *session_id,
+                                0,
+                                0,
+                            ];
+                            let _ = tokio::time::timeout(
+                                Duration::from_secs(2),
+                                atp_req_clone.send_request(sess.session_addr, user_bytes, vec![]),
+                            ).await;
+                        }
+                        services_done.cancel();
+                        break;
+                    }
 
                     // ── 30-second tickle timer ───────────────────────────────────
                     _ = tickle_interval.tick() => {

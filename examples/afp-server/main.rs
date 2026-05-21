@@ -40,7 +40,7 @@ async fn main() {
         ..AfpServerConfig::default()
     };
 
-    let _afp_server = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token())
+    let _afp_server = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token(), stack.services_done_token())
         .await
         .expect("failed to spawn AFP server");
 
@@ -52,5 +52,5 @@ async fn main() {
         .expect("failed to listen for ctrl+c");
 
     tracing::info!("Shutting down");
-    stack.shutdown();
+    stack.shutdown_handle().graceful_shutdown().await;
 }

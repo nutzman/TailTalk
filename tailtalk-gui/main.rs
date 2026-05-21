@@ -485,7 +485,7 @@ async fn server_loop(
                 pcap_path,
             } => {
                 if let Some(h) = shutdown_handle.take() {
-                    h.shutdown();
+                    h.graceful_shutdown().await;
                 }
 
                 let ui_w = ui_weak.clone();
@@ -520,7 +520,7 @@ async fn server_loop(
 
             ServerCommand::Stop => {
                 if let Some(h) = shutdown_handle.take() {
-                    h.shutdown();
+                    h.graceful_shutdown().await;
                 }
                 let ui_w = ui_weak.clone();
                 slint::invoke_from_event_loop(move || {
@@ -1125,7 +1125,7 @@ async fn run_server(
         ..AfpServerConfig::default()
     };
 
-    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token()).await {
+    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token(), stack.services_done_token()).await {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("Failed to start AFP server:\n{e}");
