@@ -41,7 +41,9 @@ impl EtherTalkPhase2Frame {
     const OUI_OFF: usize = 17;
 
     pub fn to_bytes(&self, buf: &mut [u8]) -> Result<usize, EtherTalkError> {
-        assert!(buf.len() >= Self::FRAME_LEN);
+        if buf.len() < Self::FRAME_LEN {
+            return Err(EtherTalkError::InvalidSize { found: buf.len() });
+        }
 
         buf[Self::DST_MAC_OFF..(Self::DST_MAC_OFF + self.dst_mac.len())]
             .copy_from_slice(&self.dst_mac);
@@ -82,20 +84,22 @@ impl EtherTalkPhase2Frame {
             return Err(NotSNAP);
         }
 
-        let dst_mac = &buf[Self::DST_MAC_OFF..(Self::DST_MAC_OFF + Self::MAC_LEN)];
-        let src_mac = &buf[Self::SRC_MAC_OFF..(Self::SRC_MAC_OFF + Self::MAC_LEN)];
+        let mut dst_mac = [0u8; Self::MAC_LEN];
+        dst_mac.copy_from_slice(&buf[Self::DST_MAC_OFF..(Self::DST_MAC_OFF + Self::MAC_LEN)]);
+        let mut src_mac = [0u8; Self::MAC_LEN];
+        src_mac.copy_from_slice(&buf[Self::SRC_MAC_OFF..(Self::SRC_MAC_OFF + Self::MAC_LEN)]);
 
         if buf[Self::OUI_OFF..(Self::OUI_OFF + Self::AARP_OUI.len())] == Self::AARP_OUI {
             return Ok(Self {
-                dst_mac: *dst_mac.as_array().unwrap(),
-                src_mac: *src_mac.as_array().unwrap(),
+                dst_mac,
+                src_mac,
                 len: 10,
                 protocol: EtherTalkPhase2Type::Aarp,
             });
         } else if buf[Self::OUI_OFF..(Self::OUI_OFF + Self::DDP_OUI.len())] == Self::DDP_OUI {
             return Ok(Self {
-                dst_mac: *dst_mac.as_array().unwrap(),
-                src_mac: *src_mac.as_array().unwrap(),
+                dst_mac,
+                src_mac,
                 len: 10,
                 protocol: EtherTalkPhase2Type::Ddp,
             });

@@ -202,6 +202,9 @@ impl EntityName {
         let object_length = *data.get(offset).ok_or("Missing object length")? as usize;
         offset += 1;
 
+        if offset + object_length > data.len() {
+            return Err("Object name field exceeds packet bounds".to_string());
+        }
         let (object_cow, _, _) =
             encoding_rs::MACINTOSH.decode(&data[offset..offset + object_length]);
         let object = object_cow.into_owned();
@@ -210,12 +213,18 @@ impl EntityName {
         let type_length = *data.get(offset).ok_or("Missing type length")? as usize;
         offset += 1;
 
+        if offset + type_length > data.len() {
+            return Err("Type name field exceeds packet bounds".to_string());
+        }
         let (type_cow, _, _) = encoding_rs::MACINTOSH.decode(&data[offset..offset + type_length]);
         let entity_type = type_cow.into_owned();
         offset += type_length;
 
         let zone_length = *data.get(offset).ok_or("Missing zone length")? as usize;
         offset += 1;
+        if offset + zone_length > data.len() {
+            return Err("Zone name field exceeds packet bounds".to_string());
+        }
         let (zone_cow, _, _) = encoding_rs::MACINTOSH.decode(&data[offset..offset + zone_length]);
         let zone = zone_cow.into_owned();
         offset += zone_length;

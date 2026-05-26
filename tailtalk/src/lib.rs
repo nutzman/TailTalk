@@ -7,7 +7,7 @@ use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
 use tailtalk_packets::ethertalk::{EtherTalkPhase2Frame, EtherTalkPhase2Type};
 use tailtalk_packets::llap::{LlapPacket, LlapType};
-use tashtalk::TashTalk;
+use tashtalk::{TashTalk, TashTalkError};
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 use futures::StreamExt;
@@ -564,6 +564,14 @@ impl PacketProcessor {
                                 Err(e) => {
                                     last_receive_was_error = true;
                                     tracing::error!("TashTalk receive error: {:?}", e);
+                                    if !matches!(e,
+                                        TashTalkError::FramingError
+                                        | TashTalkError::FrameAborted
+                                        | TashTalkError::CrcCheckFailed
+                                        | TashTalkError::UnknownEscape(_)
+                                    ) {
+                                        break;
+                                    }
                                 }
                             }
                         }

@@ -176,11 +176,11 @@ impl FPGetSrvrInfo {
             return Err(AfpError::InvalidSize);
         }
 
-        let machine_type_offset = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        let afp_versions_offset = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-        let uams_offset = u16::from_be_bytes([buf[4], buf[5]]) as usize;
-        let volume_icon_offset = u16::from_be_bytes([buf[6], buf[7]]) as usize;
-        let flags = u16::from_be_bytes([buf[8], buf[9]]);
+        let machine_type_offset = u16::from_be_bytes(*buf[..2].as_array().unwrap()) as usize;
+        let afp_versions_offset = u16::from_be_bytes(*buf[2..4].as_array().unwrap()) as usize;
+        let uams_offset = u16::from_be_bytes(*buf[4..6].as_array().unwrap()) as usize;
+        let volume_icon_offset = u16::from_be_bytes(*buf[6..8].as_array().unwrap()) as usize;
+        let flags = u16::from_be_bytes(*buf[8..10].as_array().unwrap());
 
         // Server Name is inline at offset 10
         let server_name_len = buf[10] as usize;
@@ -412,11 +412,13 @@ pub struct FPEnumerate {
 
 impl FPEnumerate {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        if buf.len() < 17 {
+            return Err(AfpError::InvalidSize);
+        }
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
-        let directory_bitmap =
-            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[8..10].as_array().unwrap()));
+        let directory_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(*buf[8..10].as_array().unwrap()));
         let req_count = u16::from_be_bytes(*buf[10..12].as_array().unwrap());
         let start_index = u16::from_be_bytes(*buf[12..14].as_array().unwrap());
         let max_reply_size = u16::from_be_bytes(*buf[14..16].as_array().unwrap());
@@ -446,6 +448,9 @@ pub struct FPByteRangeLock {
 
 impl FPByteRangeLock {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 11 {
+            return Err(AfpError::InvalidSize);
+        }
         // Here Be Dragons:
         // This command also does not match Inside AppleTalk. Perhaps a version difference? Very confusing.
         let flags = FPByteRangeLockFlags::from(buf[0]);
@@ -469,7 +474,10 @@ pub struct FPCloseFork {
 
 impl FPCloseFork {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
-        let fork_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        if buf.len() < 2 {
+            return Err(AfpError::InvalidSize);
+        }
+        let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
 
         Ok(Self { fork_id })
     }
@@ -493,10 +501,12 @@ pub struct FPSetDirParms {
 
 impl FPSetDirParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 9 {
+            return Err(AfpError::InvalidSize);
+        }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
-        let dir_bitmap =
-            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
         let _path_type = buf[8];
         let path = MacString::try_from(&buf[9..])?;
 
@@ -518,14 +528,19 @@ impl FPSetDirParms {
         };
 
         if dir_bitmap.contains(FPDirectoryBitmap::ATTRIBUTES) {
-            let attributes = FPFileAttributes::from(u16::from_be_bytes(
-                *buf[offset..offset + 2].as_array().unwrap(),
-            ));
+            if offset + 2 > buf.len() {
+                return Err(AfpError::InvalidSize);
+            }
+            let attributes =
+                FPFileAttributes::from(u16::from_be_bytes(*buf[offset..offset + 2].as_array().unwrap()));
             parsed_parms.attributes = Some(attributes);
             offset += 2;
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::FINDER_INFO) {
+            if offset + 32 > buf.len() {
+                return Err(AfpError::InvalidSize);
+            }
             let mut finder_info = [0u8; 32];
             finder_info.copy_from_slice(&buf[offset..offset + 32]);
             parsed_parms.finder_info = Some(finder_info);
@@ -533,32 +548,33 @@ impl FPSetDirParms {
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::OWNER_ID) {
-            let owner_id = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
+            if offset + 4 > buf.len() {
+                return Err(AfpError::InvalidSize);
+            }
+            let owner_id =
+                u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             parsed_parms.owner_id = Some(owner_id);
             offset += 4;
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::GROUP_ID) {
-            let group_id = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
+            if offset + 4 > buf.len() {
+                return Err(AfpError::InvalidSize);
+            }
+            let group_id =
+                u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             parsed_parms.group_id = Some(group_id);
             offset += 4;
         }
 
         if dir_bitmap.contains(FPDirectoryBitmap::ACCESS_RIGHTS) {
-            let owner_access = FPAccessRights::from(buf[offset]);
-            parsed_parms.owner_access = Some(owner_access);
-            offset += 1;
-
-            let group_access = FPAccessRights::from(buf[offset]);
-            parsed_parms.group_access = Some(group_access);
-            offset += 1;
-
-            let everyone_access = FPAccessRights::from(buf[offset]);
-            parsed_parms.everyone_access = Some(everyone_access);
-            offset += 1;
-
-            let user_access = FPAccessRights::from(buf[offset]);
-            parsed_parms.everyone_access = Some(user_access);
+            if offset + 4 > buf.len() {
+                return Err(AfpError::InvalidSize);
+            }
+            parsed_parms.owner_access = Some(FPAccessRights::from(buf[offset]));
+            parsed_parms.group_access = Some(FPAccessRights::from(buf[offset + 1]));
+            parsed_parms.everyone_access = Some(FPAccessRights::from(buf[offset + 2]));
+            parsed_parms.user_access = Some(FPAccessRights::from(buf[offset + 3]));
         }
 
         Ok(parsed_parms)
@@ -584,6 +600,9 @@ pub struct FPRead {
 
 impl FPRead {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 12 {
+            return Err(AfpError::InvalidSize);
+        }
         let fork_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let offset = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let req_count = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
@@ -611,6 +630,9 @@ pub struct FPFlush {
 
 impl FPFlush {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 2 {
+            return Err(AfpError::InvalidSize);
+        }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         Ok(Self { volume_id })
     }
@@ -637,6 +659,9 @@ pub struct FPGetVolParms {
 
 impl FPGetVolParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 4 {
+            return Err(AfpError::InvalidSize);
+        }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let bitmap = FPVolumeBitmap::from(u16::from_be_bytes(*buf[2..4].as_array().unwrap()));
         Ok(Self { volume_id, bitmap })
@@ -651,6 +676,9 @@ pub struct FPDelete {
 
 impl FPDelete {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 7 {
+            return Err(AfpError::InvalidSize);
+        }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
@@ -709,6 +737,9 @@ pub struct FPGetIcon {
 
 impl FPGetIcon {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 14 {
+            return Err(AfpError::InvalidSize);
+        }
         let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
         let file_type: [u8; 4] = *buf[6..10].as_array().unwrap();
@@ -760,6 +791,9 @@ pub struct FPGetComment {
 
 impl FPGetComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 7 {
+            return Err(AfpError::InvalidSize);
+        }
         let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
@@ -781,6 +815,9 @@ pub struct FPRemoveComment {
 
 impl FPRemoveComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 6 {
+            return Err(AfpError::InvalidSize);
+        }
         let directory_id = u32::from_be_bytes(*buf[1..5].as_array().unwrap());
         let _path_type = buf[5];
         let path = MacString::try_from(&buf[6..])?;
@@ -799,6 +836,9 @@ pub struct FPAddComment {
 
 impl FPAddComment {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 7 {
+            return Err(AfpError::InvalidSize);
+        }
         let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let _path_type = buf[6];
@@ -860,7 +900,7 @@ impl FPAddAPPL {
         if buf.len() < 16 {
             return Err(AfpError::InvalidSize);
         }
-        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
         let tag = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[10..14].as_array().unwrap());
@@ -891,7 +931,7 @@ impl FPRemoveAPPL {
         if buf.len() < 12 {
             return Err(AfpError::InvalidSize);
         }
-        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
         let directory_id = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
         let _path_type = buf[10];
@@ -920,7 +960,7 @@ impl FPGetAPPL {
         if buf.len() < 8 {
             return Err(AfpError::InvalidSize);
         }
-        let dt_ref_num = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let dt_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let file_creator: [u8; 4] = *buf[2..6].as_array().unwrap();
         let appl_index = u16::from_be_bytes(*buf[6..8].as_array().unwrap());
         Ok(Self { dt_ref_num, file_creator, appl_index })
@@ -974,6 +1014,9 @@ pub struct FPSetForkParms {
 
 impl FPSetForkParms {
     pub fn parse(buf: &[u8]) -> Result<Self, AfpError> {
+        if buf.len() < 4 {
+            return Err(AfpError::InvalidSize);
+        }
         let fork_ref_num = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let file_bitmap = FPFileBitmap::from(u16::from_be_bytes(*buf[2..4].as_array().unwrap()));
 
@@ -983,7 +1026,8 @@ impl FPSetForkParms {
             if offset + 4 > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            let val = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
+            let val =
+                u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             offset += 4;
             Some(val)
         } else {
@@ -994,7 +1038,8 @@ impl FPSetForkParms {
             if offset + 4 > buf.len() {
                 return Err(AfpError::InvalidSize);
             }
-            let val = u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
+            let val =
+                u32::from_be_bytes(*buf[offset..offset + 4].as_array().unwrap());
             Some(val)
         } else {
             None
@@ -1223,8 +1268,7 @@ impl FPGetDirParms {
         }
         let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
-        let dir_bitmap =
-            FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
+        let dir_bitmap = FPDirectoryBitmap::from(u16::from_be_bytes(*buf[6..8].as_array().unwrap()));
         let _path_type = buf[8];
         let path = MacString::try_from(&buf[9..])?;
         Ok(Self { volume_id, directory_id, dir_bitmap, path })
@@ -1394,7 +1438,7 @@ impl FPCopyFile {
         if buf.len() < 14 {
             return Err(AfpError::InvalidSize);
         }
-        let src_volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let src_volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let src_directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let dst_volume_id = u16::from_be_bytes(*buf[6..8].as_array().unwrap());
         let dst_directory_id = u32::from_be_bytes(*buf[8..12].as_array().unwrap());
@@ -1468,7 +1512,7 @@ impl FPMoveAndRename {
         if buf.len() < 12 {
             return Err(AfpError::InvalidSize);
         }
-        let volume_id = u16::from_be_bytes(*buf[0..2].as_array().unwrap());
+        let volume_id = u16::from_be_bytes(*buf[..2].as_array().unwrap());
         let src_directory_id = u32::from_be_bytes(*buf[2..6].as_array().unwrap());
         let dst_directory_id = u32::from_be_bytes(*buf[6..10].as_array().unwrap());
         let src_path_type = PathType::from(buf[10]);

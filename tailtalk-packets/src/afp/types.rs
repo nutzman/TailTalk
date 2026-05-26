@@ -171,9 +171,8 @@ pub enum ForkType {
 impl From<u8> for ForkType {
     fn from(value: u8) -> Self {
         match value {
-            0 => Self::Data,
             0b10000000 => Self::Resource,
-            _ => panic!("Invalid fork type"),
+            _ => Self::Data,
         }
     }
 }
@@ -251,8 +250,8 @@ impl From<[u8; 32]> for FinderInfo {
         let mut reserved = [0u8; 22];
         reserved.copy_from_slice(&raw[10..32]);
         Self {
-            file_type: raw[0..4].try_into().unwrap(),
-            creator: raw[4..8].try_into().unwrap(),
+            file_type: *raw[0..4].as_array().unwrap(),
+            creator: *raw[4..8].as_array().unwrap(),
             flags: FinderFlags::from_bits_retain(u16::from_be_bytes([raw[8], raw[9]])),
             reserved,
         }

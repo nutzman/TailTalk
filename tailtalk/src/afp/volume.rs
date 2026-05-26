@@ -123,11 +123,10 @@ impl Node {
     pub async fn open_resource_fork(&mut self, path: &Path) -> std::io::Result<()> {
         // Native macOS named-fork paths (`<file>/..namedfork/rsrc`) always exist
         // for any file and can't have their parent directory created.
-        if !is_native_resource_fork_path(path) {
-            if let Some(parent) = path.parent() {
+        if !is_native_resource_fork_path(path)
+            && let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
             }
-        }
         let file = tokio::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -882,11 +881,11 @@ impl Volume {
     /// TODO: Set this to some sane value. 4GiB is the limit for AFP 2.1 and earlier, which we want
     /// to support.
     pub fn get_bytes_free(&self) -> u32 {
-        i32::MAX as u32
+        (i32::MAX / 2) as u32
     }
 
     pub fn get_bytes_total(&self) -> u32 {
-        i32::MAX as u32
+        (i32::MAX / 2) as u32
     }
 
     /// Returns an FPVolume struct with the current volume information.
