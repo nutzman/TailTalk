@@ -256,6 +256,7 @@ impl AspSession {
                     let mut output_buf = [0u8; 128];
                     let offset = our_volume
                         .get_bitmap_resp(bitmap_req, &mut output_buf)
+                        .await
                         .map_err(|e| {
                             anyhow::anyhow!("insufficient buffer size for AFP OpenVol: {:?}", e)
                         })?;
@@ -278,6 +279,7 @@ impl AspSession {
                     let mut output_buf = [0u8; 128];
                     let offset = our_volume
                         .get_bitmap_resp(vol_parms_req.bitmap, &mut output_buf)
+                        .await
                         .map_err(|e| {
                             anyhow::anyhow!("insufficient buffer size for AFP GetVolParms: {:?}", e)
                         })?;

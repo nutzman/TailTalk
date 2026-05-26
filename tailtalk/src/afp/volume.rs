@@ -861,8 +861,9 @@ impl Volume {
     }
 
     /// Returns the last modified time of the volume as a u32 in Macintosh time format.
-    pub fn get_modified_at(&self) -> u32 {
-        std::fs::metadata(&self.path)
+    pub async fn get_modified_at(&self) -> u32 {
+        tokio::fs::metadata(&self.path)
+            .await
             .and_then(|m| m.modified())
             .map(time_to_afp_v1)
             .unwrap_or(self.created_at)
@@ -901,7 +902,7 @@ impl Volume {
     /// On success returns the number of bytes written to the output buffer.
     /// # Error
     /// Returns an error if the output buffer is too small to hold the response.
-    pub fn get_bitmap_resp(
+    pub async fn get_bitmap_resp(
         &self,
         bitmap: FPVolumeBitmap,
         output: &mut [u8],
@@ -930,7 +931,7 @@ impl Volume {
         }
 
         if bitmap.contains(FPVolumeBitmap::MODIFICATION_DATE) {
-            let modified_at_bytes = self.get_modified_at().to_be_bytes();
+            let modified_at_bytes = self.get_modified_at().await.to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&modified_at_bytes);
             offset += 4;
         }
@@ -1029,7 +1030,7 @@ impl Volume {
         }
 
         if bitmap.contains(FPDirectoryBitmap::MODIFICATION_DATE) {
-            let modified_at_bytes = self.get_modified_at().to_be_bytes();
+            let modified_at_bytes = self.get_modified_at().await.to_be_bytes();
             output[offset..offset + 4].copy_from_slice(&modified_at_bytes);
             offset += 4;
         }

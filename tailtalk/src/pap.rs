@@ -1,6 +1,7 @@
-use crate::atp::{AtpAddress, AtpRequestor, AtpResponder, AtpResponse};
+use crate::atp::{AtpAddress, AtpRequestor, AtpResponder};
 use anyhow::{Result, anyhow};
 use tailtalk_packets::pap::{PapFunction, PapPacket};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 #[derive(Debug)]
 pub struct PapClient {
@@ -80,111 +81,73 @@ impl PapClient {
 
     /// Send data (print job) to the connected printer
     pub async fn print(&mut self, data: &[u8]) -> Result<()> {
-        let mut data_offset = 0;
-        let total_len = data.len();
+        self.print_stream(std::io::Cursor::new(data)).await
+    }
 
-        tracing::info!("PAP: Starting print job, {} bytes", total_len);
+    /// Send a print job from an async reader, pulling chunks on demand as the printer requests them.
+    /// Each SendData cycle reads up to `flow_quantum * 574` bytes from the source in one shot.
+    pub async fn print_stream<R: AsyncRead + Unpin>(&mut self, mut source: R) -> Result<()> {
+        tracing::info!("PAP: Starting streaming print job");
 
-        // Loop handles incoming SendData requests from the printer
-        while data_offset < total_len {
-            // Wait for SendData request from printer
-            // We expect the printer to initiate ATP transactions.
-            if let Some(req) = self.atp_responder.next().await {
-                let pap_req = PapPacket::parse_from_atp(req.user_bytes, &req.data)?;
+        let mut eof = false;
 
-                if pap_req.connection_id != self.connection_id {
-                    tracing::warn!(
-                        "Ignored PAP packet with mismatched ID: {}",
-                        pap_req.connection_id
-                    );
-                    continue;
-                }
+        loop {
+            let Some(req) = self.atp_responder.next().await else {
+                return Err(anyhow!("ATP responder closed unexpectedly"));
+            };
 
-                if pap_req.function == PapFunction::SendData {
-                    // Printer wants data.
+            let pap_req = PapPacket::parse_from_atp(req.user_bytes, &req.data)?;
+
+            if pap_req.connection_id != self.connection_id {
+                tracing::warn!(
+                    "Ignored PAP packet with mismatched ID: {}",
+                    pap_req.connection_id
+                );
+                continue;
+            }
+
+            match pap_req.function {
+                PapFunction::SendData => {
                     let seq_num = pap_req.sequence_num;
-                    tracing::debug!(
-                        "PAP received SendData seq={} offset={}",
-                        seq_num,
-                        data_offset
-                    );
+                    tracing::debug!("PAP received SendData seq={}", seq_num);
 
-                    let mut response_packets = Vec::new();
+                    let mut buf = vec![0u8; self.flow_quantum as usize * 574];
+                    let n = source.read(&mut buf).await?;
+                    buf.truncate(n);
 
-                    for i in 0..self.flow_quantum {
-                        if data_offset >= total_len {
-                            break;
-                        }
-
-                        let chunk_size = std::cmp::min(512, total_len - data_offset);
-                        let chunk = &data[data_offset..data_offset + chunk_size];
-
-                        let pap_resp = PapPacket {
-                            connection_id: self.connection_id,
-                            function: PapFunction::Data,
-                            sequence_num: seq_num + i as u16,
-                            data: chunk.to_vec(),
-                        };
-
-                        let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
-
-                        response_packets.push(AtpResponse {
-                            user_bytes,
-                            data: chunk_data.to_vec(),
-                        });
-
-                        data_offset += chunk_size;
+                    if n == 0 {
+                        eof = true;
                     }
 
-                    // Concatenate all response packets into single data buffer
-                    // PAP uses multiple ATP packets, so we need to preserve the packet boundaries
-                    // by concatenating the PAP packet data (which includes PAP headers)
-                    let mut combined_data = Vec::new();
-                    let mut first_user_bytes = [0u8; 4];
+                    let pap_resp = PapPacket {
+                        connection_id: self.connection_id,
+                        function: PapFunction::Data,
+                        sequence_num: seq_num,
+                        data: buf,
+                    };
+                    let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
+                    req.send_response(chunk_data.to_vec(), user_bytes).await?;
 
-                    for (i, pkt) in response_packets.iter().enumerate() {
-                        if i == 0 {
-                            first_user_bytes = pkt.user_bytes;
-                        }
-                        combined_data.extend_from_slice(&pkt.data);
-                    }
-
-                    req.send_response(combined_data, first_user_bytes).await?;
-
-                    // Wait for Release if available (XO mode)
                     if let Some(rx) = req.release_rx {
-                        tracing::debug!("PAP: Waiting for ATP Release packet");
+                        tracing::debug!("PAP: Waiting for ATP Release");
                         let _ = rx.await;
                         tracing::debug!("PAP: Received ATP Release");
                     }
-                } else if pap_req.function == PapFunction::CloseConn {
+
+                    if eof {
+                        break;
+                    }
+                }
+                PapFunction::CloseConn => {
                     tracing::info!("PAP: Printer closed connection");
                     return Ok(());
                 }
-            } else {
-                return Err(anyhow!("ATP responder closed unexpectedly"));
+                _ => {}
             }
         }
 
-        // Wait for next SendData to send empty EOF
-        if let Some(req) = self.atp_responder.next().await {
-            let pap_req = PapPacket::parse_from_atp(req.user_bytes, &req.data)?;
-            if pap_req.function == PapFunction::SendData {
-                let pap_resp = PapPacket {
-                    connection_id: self.connection_id,
-                    function: PapFunction::Data,
-                    sequence_num: pap_req.sequence_num,
-                    data: vec![], // Empty
-                };
-                let (user_bytes, chunk_data) = pap_resp.to_atp_parts();
-                req.send_response(chunk_data.to_vec(), user_bytes).await?;
-            }
-        }
-
-        tracing::info!("PAP: Print job finished, closing connection");
-        self.close().await?;
-
-        Ok(())
+        tracing::info!("PAP: Streaming print job finished, closing connection");
+        self.close().await
     }
 
     pub async fn close(&mut self) -> Result<()> {
