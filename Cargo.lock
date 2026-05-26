@@ -115,7 +115,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "adsp-stylewriter"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "aep-echo-example"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "afp-server-example"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "clap",
  "tailtalk",
@@ -3377,7 +3377,7 @@ checksum = "308d96db8debc727c3fd9744aac51751243420e46edf401010908da7f8d5e57c"
 
 [[package]]
 name = "nbp-lookup-example"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -4009,7 +4009,7 @@ dependencies = [
 
 [[package]]
 name = "pap-print-example"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5515,7 +5515,7 @@ dependencies = [
 
 [[package]]
 name = "tailtalk"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -5542,7 +5542,7 @@ dependencies = [
 
 [[package]]
 name = "tailtalk-gui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -5564,7 +5564,7 @@ dependencies = [
 
 [[package]]
 name = "tailtalk-packets"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "assert_hex",
  "bitflags 2.11.0",
@@ -5588,7 +5588,7 @@ dependencies = [
 
 [[package]]
 name = "tashtalk"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "bytes",
  "futures",
