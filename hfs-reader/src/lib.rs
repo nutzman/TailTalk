@@ -1,8 +1,8 @@
 //! Read-only parser for classic HFS disk images.
 //!
-//! Supports both common HFS signatures (`0xD2D7` and `0x4244`) and handles
-//! Disk Copy 4.2 containers transparently by stripping the 84-byte header
-//! before parsing.  HFS+ (`0x482B`) is rejected with an explicit error.
+//! Accepts the HFS MDB signature (`0x4244`) and handles Disk Copy 4.2
+//! containers transparently by stripping the 84-byte header before parsing.
+//! MFS (`0xD2D7`) and HFS+ (`0x482B`) are rejected with explicit errors.
 //!
 //! # Usage
 //!
@@ -104,9 +104,12 @@ impl<'a> HfsVolume<'a> {
             .ok_or("Image too small to contain MDB")?;
 
         let sig = u16::from_be_bytes([mdb[0], mdb[1]]);
-        if sig != 0xD2D7 && sig != 0x4244 {
+        if sig != 0x4244 {
             if sig == 0x482B {
                 return Err("Image is HFS+, not HFS — only classic HFS is supported".to_string());
+            }
+            if sig == 0xD2D7 {
+                return Err("Image is MFS, not HFS — only classic HFS is supported".to_string());
             }
             return Err(format!("Not an HFS volume (MDB signature {sig:#06x})"));
         }
