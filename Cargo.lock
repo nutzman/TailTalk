@@ -5525,6 +5525,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "dashmap",
+ "encoding_rs",
  "futures",
  "im",
  "mac_address",

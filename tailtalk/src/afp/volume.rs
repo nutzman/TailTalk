@@ -9,6 +9,7 @@ use tailtalk_packets::afp::{
 };
 
 use crate::time_to_afp_v1;
+use encoding_rs::MACINTOSH;
 use tracing::{error, info};
 #[cfg(unix)]
 use xattr;
@@ -278,12 +279,14 @@ impl Node {
             output[offset..offset + 2].copy_from_slice(&(long_name_offset as u16).to_be_bytes());
             offset += 2;
 
-            output[long_name_offset] = self.name.len() as u8;
+            let (encoded_name, _, _) = MACINTOSH.encode(&self.name);
+            let name_len = encoded_name.len().min(255);
+            output[long_name_offset] = name_len as u8;
             long_name_offset += 1;
-            output[long_name_offset..long_name_offset + self.name.len()]
-                .copy_from_slice(self.name.as_bytes());
+            output[long_name_offset..long_name_offset + name_len]
+                .copy_from_slice(&encoded_name[..name_len]);
 
-            variable_len_offset += self.name.len() + 1;
+            variable_len_offset += name_len + 1;
         }
 
         if bitmap.contains(FPFileBitmap::FILE_NUMBER) {
@@ -1080,12 +1083,14 @@ impl Volume {
             output[offset..offset + 2].copy_from_slice(&(long_name_offset as u16).to_be_bytes());
             offset += 2;
 
-            output[long_name_offset] = node.name.len() as u8;
+            let (encoded_name, _, _) = MACINTOSH.encode(&node.name);
+            let name_len = encoded_name.len().min(255);
+            output[long_name_offset] = name_len as u8;
             long_name_offset += 1;
-            output[long_name_offset..long_name_offset + node.name.len()]
-                .copy_from_slice(node.name.as_bytes());
+            output[long_name_offset..long_name_offset + name_len]
+                .copy_from_slice(&encoded_name[..name_len]);
 
-            variable_len_offset += node.name.len() + 1;
+            variable_len_offset += name_len + 1;
         }
 
         if bitmap.contains(FPDirectoryBitmap::DIR_ID) {
