@@ -134,6 +134,16 @@ async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: 
         config.server_name
     );
 
+    // Open the desktop DB once and share the handle across all sessions via clone.
+    // sled::Db is internally reference-counted so all clones share the same on-disk DB.
+    let shared_db = match crate::afp::DesktopDatabase::open_or_create(&config.volume_path) {
+        Ok(db) => db,
+        Err(e) => {
+            error!("Failed to open desktop database: {:?}", e);
+            return;
+        }
+    };
+
     let mut session_count = 0;
 
     loop {
@@ -152,8 +162,9 @@ async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: 
         );
 
         let session_config = config.clone();
+        let session_db = shared_db.clone();
         tokio::spawn(async move {
-            if let Err(e) = session.handle_session(session_config).await {
+            if let Err(e) = session.handle_session(session_config, session_db).await {
                 error!("Session error: {}", e);
             }
         });
@@ -162,7 +173,7 @@ async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: 
 
 impl AspSession {
     /// Handle an AFP session
-    async fn handle_session(mut self, config: Arc<AfpServerConfig>) -> anyhow::Result<()> {
+    async fn handle_session(mut self, config: Arc<AfpServerConfig>, desktop_db: sled::Db) -> anyhow::Result<()> {
         info!("Session {} handler started", self.id);
 
         let volume_name = config.volume_name.clone();
@@ -352,7 +363,7 @@ impl AspSession {
                 }
                 tailtalk_packets::afp::AFP_CMD_OPEN_DT => {
                     debug!("AFP FPOpenDT req: (no params)");
-                    match our_volume.open_dt().await {
+                    match our_volume.open_dt(desktop_db.clone()).await {
                         Ok(ref_num) => {
                             debug!("AFP FPOpenDT resp: OK dt_ref_num={}", ref_num);
                             command.send_reply(AspCommandResponse {

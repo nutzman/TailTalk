@@ -27,10 +27,10 @@ pub struct DesktopDatabase {
 }
 
 impl DesktopDatabase {
-    pub fn new(volume_root: &Path, dt_ref_num: u16) -> Result<Self, AfpError> {
+    /// Open (or create) the desktop database at the standard path under `volume_root`.
+    pub fn open_or_create(volume_root: &Path) -> Result<sled::Db, AfpError> {
         let db_path = volume_root.join(".tailtalk").join("desktop.db");
 
-        // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 error!(
@@ -41,11 +41,22 @@ impl DesktopDatabase {
             })?;
         }
 
-        let db = sled::open(&db_path).map_err(|e| {
+        sled::open(&db_path).map_err(|e| {
             error!("Failed to open Desktop Database at {:?}: {}", db_path, e);
             AfpError::AccessDenied
-        })?;
+        })
+    }
 
+    /// Construct a `DesktopDatabase` from an already-open `sled::Db` handle.
+    /// Use this to share a single DB handle across multiple AFP sessions.
+    pub fn from_db(db: sled::Db, dt_ref_num: u16) -> Self {
+        Self { dt_ref_num, db }
+    }
+
+    /// Open (or create) the desktop database at the standard path and wrap it.
+    /// Prefer `open_or_create` + `from_db` when sharing across sessions.
+    pub fn new(volume_root: &Path, dt_ref_num: u16) -> Result<Self, AfpError> {
+        let db = Self::open_or_create(volume_root)?;
         Ok(Self { dt_ref_num, db })
     }
 

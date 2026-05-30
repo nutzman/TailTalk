@@ -1261,20 +1261,16 @@ impl Volume {
         }
     }
 
-    pub async fn open_dt(&mut self) -> Result<u16, AfpError> {
-        if let Some(ref db) = self.desktop_database {
-            return Ok(db.dt_ref_num);
-        }
-
+    pub async fn open_dt(&mut self, db: sled::Db) -> Result<u16, AfpError> {
         // Create .AppleDesktop directory so offspring counts match ClassicStack behaviour.
         let apple_desktop = self.path.join(".AppleDesktop");
         if !apple_desktop.exists() {
             let _ = tokio::fs::create_dir(&apple_desktop).await;
         }
 
-        let db = crate::afp::DesktopDatabase::new(&self.path, 1)?;
-        let ref_num = db.dt_ref_num;
-        self.desktop_database = Some(db);
+        let desktop_db = crate::afp::DesktopDatabase::from_db(db, 1);
+        let ref_num = desktop_db.dt_ref_num;
+        self.desktop_database = Some(desktop_db);
         Ok(ref_num)
     }
 
@@ -3044,7 +3040,7 @@ mod tests {
         File::create(root_path.join("readme.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt().await.unwrap();
+        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         // Set
@@ -3077,7 +3073,7 @@ mod tests {
         // First volume instance: set a comment
         {
             let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-            volume.open_dt().await.unwrap();
+            volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
             volume.walk_dir(PathBuf::new()).await.unwrap();
             volume
                 .set_comment(2, Path::new("persist.txt"), b"survives restart")
@@ -3087,7 +3083,7 @@ mod tests {
         // Second volume instance (simulates server restart): comment must still be there
         {
             let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-            volume.open_dt().await.unwrap();
+            volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
             volume.walk_dir(PathBuf::new()).await.unwrap();
             let got = volume
                 .get_comment(2, Path::new("persist.txt"))
@@ -3103,7 +3099,7 @@ mod tests {
         File::create(root_path.join("before.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt().await.unwrap();
+        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         volume.set_comment(2, Path::new("before.txt"), b"my comment").unwrap();
@@ -3129,7 +3125,7 @@ mod tests {
         File::create(root_path.join("src_dir").join("file.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt().await.unwrap();
+        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         let src_dir_id = volume.resolve_node(2, Path::new("src_dir")).unwrap();
@@ -3159,7 +3155,7 @@ mod tests {
         File::create(root_path.join("original.txt")).await.unwrap();
 
         let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt().await.unwrap();
+        volume.open_dt(crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap()).await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         let dst_dir_id = volume.resolve_node(2, Path::new("dst_dir")).unwrap();
@@ -3184,8 +3180,11 @@ mod tests {
         let root_path = dir.path().to_path_buf();
         File::create(root_path.join("doomed.txt")).await.unwrap();
 
+        // Open the shared DB handle once; clone it for the second volume instance.
+        let shared_db = crate::afp::DesktopDatabase::open_or_create(&root_path).unwrap();
+
         let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume.open_dt().await.unwrap();
+        volume.open_dt(shared_db.clone()).await.unwrap();
         volume.walk_dir(PathBuf::new()).await.unwrap();
 
         volume.set_comment(2, Path::new("doomed.txt"), b"goodbye").unwrap();
@@ -3197,17 +3196,11 @@ mod tests {
         };
         volume.delete(&delete_req).await.unwrap();
 
-        // Drop the first volume so sled releases its lock before we reopen.
-        drop(volume);
-
-        // Reopen the volume from disk — the comment key must not be present.
-        let mut volume2 = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
-        volume2.open_dt().await.unwrap();
-
-        // Directly query the DB; the file node is gone so we can't go via resolve_node.
-        let db = volume2.desktop_database.as_ref().unwrap();
+        // Query the DB directly via the shared handle — the file node is gone so
+        // we can't go via resolve_node, and no drop/reopen is needed.
         assert_eq!(
-            db.get_comment(std::path::Path::new("doomed.txt")),
+            crate::afp::DesktopDatabase::from_db(shared_db, 1)
+                .get_comment(std::path::Path::new("doomed.txt")),
             Err(AfpError::ItemNotFound),
             "comment should have been deleted with the file"
         );
