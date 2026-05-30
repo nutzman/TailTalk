@@ -7,7 +7,7 @@ use tailtalk::{
     adsp::{Adsp, AdspAddress},
     ddp::DdpProcessor,
 };
-use tailtalk_packets::{aarp::AddressSource, ethertalk::EtherTalkPhase2Type};
+use tailtalk_packets::aarp::AddressSource;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 

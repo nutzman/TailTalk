@@ -1,5 +1,6 @@
 use crate::afp::volume::afp_path_to_posix;
 use crate::afp::Volume;
+use encoding_rs::MACINTOSH;
 use crate::asp::{Asp, AspCommandResponse, AspHandle, AspSession};
 use crate::ddp::DdpHandle;
 use crate::nbp::NbpHandle;
@@ -1812,13 +1813,14 @@ impl AspSession {
                     "AFP FPGetAPPL resp: OK tag={:#010x}, dir_id={}, path={:?}",
                     tag, directory_id, path
                 );
-                let path_bytes = path.as_bytes();
-                let mut data = Vec::with_capacity(9 + path_bytes.len());
+                let (encoded_path, _, _) = MACINTOSH.encode(&path);
+                let path_len = encoded_path.len().min(255);
+                let mut data = Vec::with_capacity(9 + path_len);
                 data.extend_from_slice(&tag.to_be_bytes());
                 data.extend_from_slice(&directory_id.to_be_bytes());
                 data.push(0x02); // PathType: LongName
-                data.push(path_bytes.len() as u8);
-                data.extend_from_slice(path_bytes);
+                data.push(path_len as u8);
+                data.extend_from_slice(&encoded_path[..path_len]);
                 command.send_reply(AspCommandResponse {
                     result: [0u8; 4],
                     data,

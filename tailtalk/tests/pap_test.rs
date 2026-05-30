@@ -12,7 +12,6 @@ use tailtalk::{
 };
 use tailtalk_packets::{
     aarp::AddressSource,
-    ethertalk::EtherTalkPhase2Type,
     pap::{PapFunction, PapPacket},
 };
 use tokio::sync::{broadcast, mpsc};

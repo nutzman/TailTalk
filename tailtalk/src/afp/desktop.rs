@@ -144,33 +144,35 @@ impl DesktopDatabase {
         Err(AfpError::ItemNotFound)
     }
 
-    pub fn set_comment(&self, node_id: u32, comment: &[u8]) -> Result<(), AfpError> {
+    pub fn set_comment(&self, rel_path: &std::path::Path, comment: &[u8]) -> Result<(), AfpError> {
         let tree = self.db.open_tree(b"comments").map_err(|e| {
             error!("Failed to open 'comments' tree: {}", e);
             AfpError::AccessDenied
         })?;
 
-        tree.insert(node_id.to_be_bytes(), comment).map_err(|e| {
+        let key = rel_path.to_string_lossy();
+        tree.insert(key.as_bytes(), comment).map_err(|e| {
             error!("Failed to insert comment: {}", e);
             AfpError::AccessDenied
         })?;
 
         tracing::info!(
-            "Set comment of length {} for node {}",
+            "Set comment of length {} for path {:?}",
             comment.len(),
-            node_id
+            rel_path
         );
         Ok(())
     }
 
-    pub fn get_comment(&self, node_id: u32) -> Result<Vec<u8>, AfpError> {
+    pub fn get_comment(&self, rel_path: &std::path::Path) -> Result<Vec<u8>, AfpError> {
         let tree = self.db.open_tree(b"comments").map_err(|e| {
             error!("Failed to open 'comments' tree: {}", e);
             AfpError::AccessDenied
         })?;
 
-        tracing::info!("Get comment for node {}", node_id);
-        if let Some(data) = tree.get(node_id.to_be_bytes()).map_err(|e| {
+        tracing::info!("Get comment for path {:?}", rel_path);
+        let key = rel_path.to_string_lossy();
+        if let Some(data) = tree.get(key.as_bytes()).map_err(|e| {
             error!("Failed to get comment: {}", e);
             AfpError::AccessDenied
         })? {
@@ -180,13 +182,14 @@ impl DesktopDatabase {
         }
     }
 
-    pub fn remove_comment(&self, node_id: u32) -> Result<(), AfpError> {
+    pub fn remove_comment(&self, rel_path: &std::path::Path) -> Result<(), AfpError> {
         let tree = self.db.open_tree(b"comments").map_err(|e| {
             error!("Failed to open 'comments' tree: {}", e);
             AfpError::AccessDenied
         })?;
 
-        tree.remove(node_id.to_be_bytes()).map_err(|e| {
+        let key = rel_path.to_string_lossy();
+        tree.remove(key.as_bytes()).map_err(|e| {
             error!("Failed to remove comment: {}", e);
             AfpError::AccessDenied
         })?;

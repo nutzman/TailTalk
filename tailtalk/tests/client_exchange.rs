@@ -9,10 +9,7 @@ use tailtalk::{
     echo::Echo,
     nbp::{Nbp, RegisteredName},
 };
-use tailtalk_packets::{
-    aarp::{AddressSource, AppleTalkAddress},
-    ethertalk::EtherTalkPhase2Type,
-};
+use tailtalk_packets::aarp::{AddressSource, AppleTalkAddress};
 use tokio::sync::{broadcast, mpsc};
 
 #[derive(Clone, Debug)]

@@ -8,7 +8,6 @@ use tailtalk::{
 use tailtalk_packets::{
     aarp::AddressSource,
     afp::{AfpUam, AfpVersion, FPGetSrvrInfo},
-    ethertalk::EtherTalkPhase2Type,
 };
 use tokio::sync::{broadcast, mpsc};
 

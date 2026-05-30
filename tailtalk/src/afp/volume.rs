@@ -2150,9 +2150,9 @@ impl Volume {
         comment: &[u8],
     ) -> Result<(), AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
-        tracing::info!("Setting comment for node {}", node_id);
+        let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
         if let Some(db) = &self.desktop_database {
-            db.set_comment(node_id, comment)
+            db.set_comment(&rel_path, comment)
         } else {
             Err(AfpError::AccessDenied)
         }
@@ -2160,8 +2160,9 @@ impl Volume {
 
     pub fn get_comment(&self, directory_id: u32, path: &Path) -> Result<Vec<u8>, AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
+        let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
         if let Some(db) = &self.desktop_database {
-            db.get_comment(node_id)
+            db.get_comment(&rel_path)
         } else {
             Err(AfpError::AccessDenied)
         }
@@ -2169,8 +2170,9 @@ impl Volume {
 
     pub fn remove_comment(&self, directory_id: u32, path: &Path) -> Result<(), AfpError> {
         let node_id = self.resolve_node(directory_id, path)?;
+        let rel_path = self.nodes.get(&node_id).ok_or(AfpError::ObjectNotFound)?.path.clone();
         if let Some(db) = &self.desktop_database {
-            db.remove_comment(node_id)
+            db.remove_comment(&rel_path)
         } else {
             Err(AfpError::AccessDenied)
         }
@@ -3001,5 +3003,64 @@ mod tests {
         // Step 9: resolve by name in parent must also fail.
         let result = volume.resolve_node(network_trash_id, Path::new("Trash Can #2"));
         assert!(result.is_err(), "deleted dir must not resolve by name");
+    }
+
+    #[tokio::test]
+    async fn test_comment_set_get_remove() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("readme.txt")).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume.open_dt().await.unwrap();
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        // Set
+        volume
+            .set_comment(2, Path::new("readme.txt"), b"hello comment")
+            .unwrap();
+
+        // Get returns what was set
+        let got = volume.get_comment(2, Path::new("readme.txt")).unwrap();
+        assert_eq!(got, b"hello comment");
+
+        // Remove
+        volume
+            .remove_comment(2, Path::new("readme.txt"))
+            .unwrap();
+
+        // Get after remove returns ItemNotFound
+        assert_eq!(
+            volume.get_comment(2, Path::new("readme.txt")),
+            Err(AfpError::ItemNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_survives_volume_restart() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("persist.txt")).await.unwrap();
+
+        // First volume instance: set a comment
+        {
+            let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+            volume.open_dt().await.unwrap();
+            volume.walk_dir(PathBuf::new()).await.unwrap();
+            volume
+                .set_comment(2, Path::new("persist.txt"), b"survives restart")
+                .unwrap();
+        }
+
+        // Second volume instance (simulates server restart): comment must still be there
+        {
+            let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+            volume.open_dt().await.unwrap();
+            volume.walk_dir(PathBuf::new()).await.unwrap();
+            let got = volume
+                .get_comment(2, Path::new("persist.txt"))
+                .unwrap();
+            assert_eq!(got, b"survives restart");
+        }
     }
 }
