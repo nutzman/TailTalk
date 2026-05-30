@@ -196,6 +196,182 @@ impl DesktopDatabase {
         Ok(())
     }
 
+    /// Move a comment from `old_path` to `new_path`, used when a file is renamed or moved.
+    /// Silently succeeds if no comment exists for `old_path`.
+    pub fn move_comment(
+        &self,
+        old_path: &std::path::Path,
+        new_path: &std::path::Path,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"comments").map_err(|e| {
+            error!("Failed to open 'comments' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let old_key = old_path.to_string_lossy();
+        if let Some(data) = tree.remove(old_key.as_bytes()).map_err(|e| {
+            error!("Failed to remove old comment key: {}", e);
+            AfpError::AccessDenied
+        })? {
+            let new_key = new_path.to_string_lossy();
+            tree.insert(new_key.as_bytes(), data).map_err(|e| {
+                error!("Failed to insert comment at new key: {}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Copy a comment from `src_path` to `dst_path`, used when a file is copied.
+    /// Silently succeeds if no comment exists for `src_path`.
+    pub fn copy_comment(
+        &self,
+        src_path: &std::path::Path,
+        dst_path: &std::path::Path,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"comments").map_err(|e| {
+            error!("Failed to open 'comments' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let src_key = src_path.to_string_lossy();
+        if let Some(data) = tree.get(src_key.as_bytes()).map_err(|e| {
+            error!("Failed to read comment for copy: {}", e);
+            AfpError::AccessDenied
+        })? {
+            let dst_key = dst_path.to_string_lossy();
+            tree.insert(dst_key.as_bytes(), data).map_err(|e| {
+                error!("Failed to insert copied comment: {}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Update the stored path in every APPL entry that matches `old_path`, used when
+    /// a file is renamed or moved.  Silently succeeds if no matching entry exists.
+    pub fn move_appl_path(
+        &self,
+        old_path: &str,
+        new_path: &str,
+        old_dir_id: u32,
+        new_dir_id: u32,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let old_dir_bytes = old_dir_id.to_be_bytes();
+        let old_path_bytes = old_path.as_bytes();
+
+        let matches: Vec<(sled::IVec, sled::IVec)> = tree
+            .iter()
+            .filter_map(|r| r.ok())
+            .filter(|(_, v)| {
+                v.len() >= 5
+                    && v[0..4] == old_dir_bytes
+                    && {
+                        let path_len = v[4] as usize;
+                        v.len() >= 5 + path_len && &v[5..5 + path_len] == old_path_bytes
+                    }
+            })
+            .collect();
+
+        let new_path_bytes = new_path.as_bytes();
+        let new_dir_bytes = new_dir_id.to_be_bytes();
+        for (key, _) in matches {
+            let mut value = Vec::with_capacity(5 + new_path_bytes.len());
+            value.extend_from_slice(&new_dir_bytes);
+            value.push(new_path_bytes.len() as u8);
+            value.extend_from_slice(new_path_bytes);
+            tree.insert(key, value).map_err(|e| {
+                error!("Failed to update APPL path: {}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Copy APPL entries from `src_path` to `dst_path`, used when a file is copied.
+    /// Silently succeeds if no matching entry exists.
+    pub fn copy_appl(
+        &self,
+        src_path: &str,
+        dst_path: &str,
+        src_dir_id: u32,
+        dst_dir_id: u32,
+    ) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let src_dir_bytes = src_dir_id.to_be_bytes();
+        let src_path_bytes = src_path.as_bytes();
+
+        let matches: Vec<(sled::IVec, sled::IVec)> = tree
+            .iter()
+            .filter_map(|r| r.ok())
+            .filter(|(_, v)| {
+                v.len() >= 5
+                    && v[0..4] == src_dir_bytes
+                    && {
+                        let path_len = v[4] as usize;
+                        v.len() >= 5 + path_len && &v[5..5 + path_len] == src_path_bytes
+                    }
+            })
+            .collect();
+
+        let dst_path_bytes = dst_path.as_bytes();
+        let dst_dir_bytes = dst_dir_id.to_be_bytes();
+        for (key, _) in matches {
+            let mut value = Vec::with_capacity(5 + dst_path_bytes.len());
+            value.extend_from_slice(&dst_dir_bytes);
+            value.push(dst_path_bytes.len() as u8);
+            value.extend_from_slice(dst_path_bytes);
+            tree.insert(key, value).map_err(|e| {
+                error!("Failed to insert copied APPL: {}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Remove all APPL entries whose stored path matches `path` and directory ID matches
+    /// `dir_id`. Used when a file is deleted. Silently succeeds if no match exists.
+    pub fn delete_appls_for_path(&self, dir_id: u32, path: &str) -> Result<(), AfpError> {
+        let tree = self.db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+
+        let dir_bytes = dir_id.to_be_bytes();
+        let path_bytes = path.as_bytes();
+
+        let keys: Vec<sled::IVec> = tree
+            .iter()
+            .filter_map(|r| r.ok())
+            .filter(|(_, v)| {
+                v.len() >= 5
+                    && v[0..4] == dir_bytes
+                    && {
+                        let path_len = v[4] as usize;
+                        v.len() >= 5 + path_len && &v[5..5 + path_len] == path_bytes
+                    }
+            })
+            .map(|(k, _)| k)
+            .collect();
+
+        for key in keys {
+            tree.remove(key).map_err(|e| {
+                error!("Failed to remove APPL entry: {}", e);
+                AfpError::AccessDenied
+            })?;
+        }
+        Ok(())
+    }
+
     /// Register an application in the Desktop DB.
     ///
     /// Key: creator (4) + tag (4, big-endian) — one entry per (creator, tag) pair.

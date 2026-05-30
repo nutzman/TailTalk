@@ -1868,7 +1868,20 @@ impl Volume {
             for (id, old_path, new_child_path) in child_updates {
                 self.path_to_id.remove(&old_path);
                 self.path_to_id.insert(new_child_path.clone(), id);
+                if let Some(db) = &self.desktop_database {
+                    let _ = db.move_comment(&old_path, &new_child_path);
+                }
                 self.nodes.get_mut(&id).unwrap().path = new_child_path;
+            }
+        }
+
+        // Migrate comment and APPL registration to the new path.
+        if let Some(db) = &self.desktop_database {
+            let _ = db.move_comment(&src_old_relative, &new_relative);
+            if !src_is_dir {
+                let old_path_str = src_old_relative.to_string_lossy();
+                let new_path_str = new_relative.to_string_lossy();
+                let _ = db.move_appl_path(&old_path_str, &new_path_str, src_dir_id, dst_node_id);
             }
         }
 
@@ -1940,6 +1953,17 @@ impl Volume {
         if !is_dir {
             let sidecar = rsrc_path(&self.path, &relative_path);
             let _ = tokio::fs::remove_file(&sidecar).await;
+        }
+
+        // Clean up desktop DB entries for this path.
+        // Icons are keyed by type/creator and are intentionally shared, so they are not removed.
+        if let Some(db) = &self.desktop_database {
+            let _ = db.remove_comment(&relative_path);
+            if !is_dir {
+                let path_str = relative_path.to_string_lossy();
+                let parent_id = self.nodes.get(&node_id).map(|n| n.parent_id).unwrap_or(0);
+                let _ = db.delete_appls_for_path(parent_id, &path_str);
+            }
         }
 
         self.nodes.remove(&node_id);
@@ -2021,6 +2045,14 @@ impl Volume {
                 let _ = tokio::fs::create_dir_all(parent).await;
             }
             let _ = tokio::fs::copy(&src_sidecar, &dst_sidecar).await;
+        }
+
+        // Copy comment and APPL registration to the new path.
+        if let Some(db) = &self.desktop_database {
+            let _ = db.copy_comment(&src_relative, &new_relative);
+            let src_path_str = src_relative.to_string_lossy();
+            let new_path_str = new_relative.to_string_lossy();
+            let _ = db.copy_appl(&src_path_str, &new_path_str, src_dir_id, dst_node_id);
         }
 
         let new_id = self.next_id;
@@ -3062,5 +3094,122 @@ mod tests {
                 .unwrap();
             assert_eq!(got, b"survives restart");
         }
+    }
+
+    #[tokio::test]
+    async fn test_comment_follows_rename() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("before.txt")).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume.open_dt().await.unwrap();
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        volume.set_comment(2, Path::new("before.txt"), b"my comment").unwrap();
+        volume.rename(2, Path::new("before.txt"), "after.txt").await.unwrap();
+
+        // Comment must be accessible under the new name.
+        let got = volume.get_comment(2, Path::new("after.txt")).unwrap();
+        assert_eq!(got, b"my comment");
+
+        // Old path no longer resolves — node itself is gone.
+        assert_eq!(
+            volume.get_comment(2, Path::new("before.txt")),
+            Err(AfpError::ObjectNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_follows_move() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(root_path.join("src_dir")).await.unwrap();
+        tokio::fs::create_dir(root_path.join("dst_dir")).await.unwrap();
+        File::create(root_path.join("src_dir").join("file.txt")).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume.open_dt().await.unwrap();
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        let src_dir_id = volume.resolve_node(2, Path::new("src_dir")).unwrap();
+        let dst_dir_id = volume.resolve_node(2, Path::new("dst_dir")).unwrap();
+
+        volume.set_comment(src_dir_id, Path::new("file.txt"), b"moved comment").unwrap();
+        volume
+            .move_and_rename(src_dir_id, dst_dir_id, Path::new("file.txt"), Path::new(""), "")
+            .await
+            .unwrap();
+
+        let got = volume.get_comment(dst_dir_id, Path::new("file.txt")).unwrap();
+        assert_eq!(got, b"moved comment");
+
+        // Old path no longer resolves — node itself is gone from src_dir.
+        assert_eq!(
+            volume.get_comment(src_dir_id, Path::new("file.txt")),
+            Err(AfpError::ObjectNotFound)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_comment_copied_with_file() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        tokio::fs::create_dir(root_path.join("dst_dir")).await.unwrap();
+        File::create(root_path.join("original.txt")).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume.open_dt().await.unwrap();
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        let dst_dir_id = volume.resolve_node(2, Path::new("dst_dir")).unwrap();
+
+        volume.set_comment(2, Path::new("original.txt"), b"copied comment").unwrap();
+        volume
+            .copy_file(2, Path::new("original.txt"), dst_dir_id, Path::new(""), "copy.txt")
+            .await
+            .unwrap();
+
+        // Both source and destination should have the comment.
+        let src_got = volume.get_comment(2, Path::new("original.txt")).unwrap();
+        assert_eq!(src_got, b"copied comment");
+
+        let dst_got = volume.get_comment(dst_dir_id, Path::new("copy.txt")).unwrap();
+        assert_eq!(dst_got, b"copied comment");
+    }
+
+    #[tokio::test]
+    async fn test_comment_removed_on_delete() {
+        let dir = tempdir().unwrap();
+        let root_path = dir.path().to_path_buf();
+        File::create(root_path.join("doomed.txt")).await.unwrap();
+
+        let mut volume = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume.open_dt().await.unwrap();
+        volume.walk_dir(PathBuf::new()).await.unwrap();
+
+        volume.set_comment(2, Path::new("doomed.txt"), b"goodbye").unwrap();
+
+        let delete_req = tailtalk_packets::afp::FPDelete {
+            volume_id: 1,
+            directory_id: 2,
+            path: "doomed.txt".into(),
+        };
+        volume.delete(&delete_req).await.unwrap();
+
+        // Drop the first volume so sled releases its lock before we reopen.
+        drop(volume);
+
+        // Reopen the volume from disk — the comment key must not be present.
+        let mut volume2 = Volume::new("TestVol".to_string(), root_path.clone(), 1).await;
+        volume2.open_dt().await.unwrap();
+
+        // Directly query the DB; the file node is gone so we can't go via resolve_node.
+        let db = volume2.desktop_database.as_ref().unwrap();
+        assert_eq!(
+            db.get_comment(std::path::Path::new("doomed.txt")),
+            Err(AfpError::ItemNotFound),
+            "comment should have been deleted with the file"
+        );
     }
 }
