@@ -93,15 +93,16 @@ impl Decoder for TashTalkCodec {
 
                         return match code {
                             0xFD => Ok(Some(unescaped)),
-                            0xFE => Err(TashTalkError::FramingError),
-                            0xFA => Err(TashTalkError::FrameAborted),
-                            0xFC => Err(TashTalkError::CrcCheckFailed),
+                            0xFE => { tracing::warn!("LocalTalk framing error"); Ok(None) }
+                            0xFA => { tracing::warn!("LocalTalk frame aborted"); Ok(None) }
+                            0xFC => { tracing::warn!("LocalTalk CRC check failed"); Ok(None) }
                             _ => unreachable!(),
                         };
                     }
                     unknown => {
                         src.advance(i + 2);
-                        return Err(TashTalkError::UnknownEscape(unknown));
+                        tracing::warn!("LocalTalk unknown escape sequence: {:#04X}", unknown);
+                        return Ok(None);
                     }
                 }
             } else {
@@ -160,15 +161,23 @@ mod tests {
         let res = codec.decode(&mut buf).unwrap().unwrap();
         assert_eq!(res, vec![0xAA, 0x00, 0xBB]);
 
-        // Framing Error
+        // Framing error, frame aborted, CRC failure — all return Ok(None) and consume the frame
         let mut buf = BytesMut::from(&[0x00, 0xFE][..]);
-        let err = codec.decode(&mut buf).unwrap_err();
-        assert!(matches!(err, TashTalkError::FramingError));
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(buf.is_empty());
 
-        // Unknown escape -> error
+        let mut buf = BytesMut::from(&[0xAA, 0xBB, 0x00, 0xFA][..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(buf.is_empty());
+
+        let mut buf = BytesMut::from(&[0xAA, 0xBB, 0x00, 0xFC][..]);
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(buf.is_empty());
+
+        // Unknown escape — returns Ok(None) and advances past the two bytes
         let mut buf = BytesMut::from(&[0x00, 0x01][..]);
-        let err = codec.decode(&mut buf).unwrap_err();
-        assert!(matches!(err, TashTalkError::UnknownEscape(0x01)));
+        assert_eq!(codec.decode(&mut buf).unwrap(), None);
+        assert!(buf.is_empty());
 
         // Incomplete
         let mut buf = BytesMut::from(&[0xAA, 0xBB][..]);

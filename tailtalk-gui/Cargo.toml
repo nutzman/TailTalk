@@ -15,21 +15,21 @@ ethertalk = ["dep:if-addrs"]
 
 [dependencies]
 anyhow = { workspace = true } #unified
+dirs = "5"
+hfs-reader = { workspace = true } #unified
+if-addrs = { version = "0.13", optional = true }
 rfd = "0.15"
+serde = { version = "1", features = ["derive"] }
+serialport = { version = "4", optional = true }
 slint = "1"
+stuffit = "0.1.4"
 tailtalk = { workspace = true } #unified
 tailtalk-packets = { workspace = true } #unified
 tokio = { workspace = true, features = ["io-util"] } #unified
-tracing = { workspace = true } #unified
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-tracing-appender = "0.2"
-dirs = "5"
-serde = { version = "1", features = ["derive"] }
 toml = "0.8"
-if-addrs = { version = "0.13", optional = true }
-serialport = { version = "4", optional = true }
-stuffit = "0.1.4"
-hfs-reader = { path = "../hfs-reader" }
+tracing = { workspace = true } #unified
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [build-dependencies]
 slint-build = "1"

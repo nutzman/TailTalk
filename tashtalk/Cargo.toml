@@ -12,3 +12,4 @@ futures = { workspace = true } #unified
 thiserror = { workspace = true } #unified
 tokio = { workspace = true, features = ["full"] } #unified
 tokio-util = { version = "0.7.12", features = ["codec"] }
+tracing = { workspace = true } #unified

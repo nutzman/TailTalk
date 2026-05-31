@@ -370,7 +370,7 @@ fn main() -> anyhow::Result<()> {
         });
     });
 
-    ui.on_clamp_ostype(|s| s.chars().take(4).collect::<String>().into());
+    ui.on_clamp_to_one(|s| s.chars().next().map_or(String::new(), |c| c.to_string()).into());
 
     let ui_weak = ui.as_weak();
     let rt_handle_fi = rt_handle.clone();
@@ -404,14 +404,20 @@ fn main() -> anyhow::Result<()> {
                 }
             };
 
-            let type_str = ostype_to_string(&info.file_type);
-            let creator_str = ostype_to_string(&info.creator);
+            let type_chars = ostype_to_chars(&info.file_type);
+            let creator_chars = ostype_to_chars(&info.creator);
             let path_str: SharedString = path.to_string_lossy().into_owned().into();
 
             slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    ui.set_finder_info_type(type_str.into());
-                    ui.set_finder_info_creator(creator_str.into());
+                    ui.set_finder_info_type_0(type_chars[0].clone());
+                    ui.set_finder_info_type_1(type_chars[1].clone());
+                    ui.set_finder_info_type_2(type_chars[2].clone());
+                    ui.set_finder_info_type_3(type_chars[3].clone());
+                    ui.set_finder_info_creator_0(creator_chars[0].clone());
+                    ui.set_finder_info_creator_1(creator_chars[1].clone());
+                    ui.set_finder_info_creator_2(creator_chars[2].clone());
+                    ui.set_finder_info_creator_3(creator_chars[3].clone());
                     ui.set_finder_info_path(path_str);
                     ui.set_finder_info_visible(true);
                 }
@@ -425,8 +431,22 @@ fn main() -> anyhow::Result<()> {
     ui.on_save_finder_info(move || {
         let Some(ui) = ui_weak.upgrade() else { return };
         let path = PathBuf::from(ui.get_finder_info_path().as_str());
-        let file_type = string_to_ostype(&ui.get_finder_info_type());
-        let creator = string_to_ostype(&ui.get_finder_info_creator());
+        let type_str = format!(
+            "{}{}{}{}",
+            ui.get_finder_info_type_0(),
+            ui.get_finder_info_type_1(),
+            ui.get_finder_info_type_2(),
+            ui.get_finder_info_type_3(),
+        );
+        let creator_str = format!(
+            "{}{}{}{}",
+            ui.get_finder_info_creator_0(),
+            ui.get_finder_info_creator_1(),
+            ui.get_finder_info_creator_2(),
+            ui.get_finder_info_creator_3(),
+        );
+        let file_type = string_to_ostype(&type_str);
+        let creator = string_to_ostype(&creator_str);
         let ui_weak = ui_weak.clone();
 
         rt_handle_sfi.spawn(async move {
@@ -683,6 +703,15 @@ fn show_info(ui_weak: slint::Weak<AppWindow>, message: String) {
 }
 
 // ── OSType (4-byte Mac type/creator code) helpers ────────────────────────────
+
+/// Split a 4-byte OSType into 4 individual SharedStrings for the per-character UI boxes.
+fn ostype_to_chars(bytes: &[u8]) -> [SharedString; 4] {
+    let s = ostype_to_string(bytes);
+    let mut chars = s.chars();
+    std::array::from_fn(|_| {
+        chars.next().map_or(SharedString::default(), |c| c.to_string().into())
+    })
+}
 
 /// Convert a 4-byte OSType to a displayable string, replacing non-graphic bytes with spaces.
 fn ostype_to_string(bytes: &[u8]) -> String {
@@ -1311,7 +1340,7 @@ async fn run_server(
 ) {
     use tailtalk::{
         TalkStack,
-        afp::{AfpServer, AfpServerConfig},
+        afp::AfpServerConfig,
     };
 
     let set_stopped = |ui_weak: slint::Weak<AppWindow>| {
@@ -1407,7 +1436,7 @@ async fn run_server(
         ..AfpServerConfig::default()
     };
 
-    let _afp = match AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token(), stack.services_done_token()).await {
+    let _afp = match stack.spawn_afp(Some(254), afp_config).await {
         Ok(s) => s,
         Err(e) => {
             let msg = format!("Failed to start AFP server:\n{e}");

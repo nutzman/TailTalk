@@ -26,8 +26,14 @@ export component AppWindow inherits Window {
 
     in-out property <bool> finder-info-visible: false;
     in-out property <string> finder-info-path: "";
-    in-out property <string> finder-info-type: "";
-    in-out property <string> finder-info-creator: "";
+    in-out property <string> finder-info-type-0: "";
+    in-out property <string> finder-info-type-1: "";
+    in-out property <string> finder-info-type-2: "";
+    in-out property <string> finder-info-type-3: "";
+    in-out property <string> finder-info-creator-0: "";
+    in-out property <string> finder-info-creator-1: "";
+    in-out property <string> finder-info-creator-2: "";
+    in-out property <string> finder-info-creator-3: "";
 
     callback start-stop();
     callback browse-volume();
@@ -36,8 +42,8 @@ export component AppWindow inherits Window {
     callback import-hfs-image();
     callback inspect-finder-info();
     callback save-finder-info();
-    // Returns the input truncated to 4 characters; registered in Rust.
-    callback clamp-ostype(string) -> string;
+    // Returns the input truncated to 1 character; registered in Rust.
+    callback clamp-to-one(string) -> string;
 
     MenuBar {
         Menu {
@@ -290,22 +296,90 @@ export component AppWindow inherits Window {
 
                 HorizontalBox {
                     Text { text: "File Type:"; min-width: 80px; vertical-alignment: center; color: #1a1a1a; }
-                    LineEdit {
-                        text <=> root.finder-info-type;
-                        placeholder-text: "    ";
-                        horizontal-stretch: 1;
-                        edited(t) => { root.finder-info-type = root.clamp-ostype(t); }
+                    HorizontalBox {
+                        spacing: 4px;
+                        padding: 0;
+                        type-edit-0 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-type-0;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-type-0 = root.clamp-to-one(t);
+                                if (t != "") { type-edit-1.focus(); }
+                            }
+                        }
+                        type-edit-1 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-type-1;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-type-1 = root.clamp-to-one(t);
+                                if (t != "") { type-edit-2.focus(); }
+                            }
+                        }
+                        type-edit-2 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-type-2;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-type-2 = root.clamp-to-one(t);
+                                if (t != "") { type-edit-3.focus(); }
+                            }
+                        }
+                        type-edit-3 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-type-3;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-type-3 = root.clamp-to-one(t);
+                            }
+                        }
                     }
+                    Rectangle { horizontal-stretch: 1; }
                 }
 
                 HorizontalBox {
                     Text { text: "Creator:"; min-width: 80px; vertical-alignment: center; color: #1a1a1a; }
-                    LineEdit {
-                        text <=> root.finder-info-creator;
-                        placeholder-text: "    ";
-                        horizontal-stretch: 1;
-                        edited(t) => { root.finder-info-creator = root.clamp-ostype(t); }
+                    HorizontalBox {
+                        spacing: 4px;
+                        padding: 0;
+                        creator-edit-0 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-creator-0;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-creator-0 = root.clamp-to-one(t);
+                                if (t != "") { creator-edit-1.focus(); }
+                            }
+                        }
+                        creator-edit-1 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-creator-1;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-creator-1 = root.clamp-to-one(t);
+                                if (t != "") { creator-edit-2.focus(); }
+                            }
+                        }
+                        creator-edit-2 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-creator-2;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-creator-2 = root.clamp-to-one(t);
+                                if (t != "") { creator-edit-3.focus(); }
+                            }
+                        }
+                        creator-edit-3 := LineEdit {
+                            width: 36px;
+                            text <=> root.finder-info-creator-3;
+                            horizontal-alignment: center;
+                            edited(t) => {
+                                root.finder-info-creator-3 = root.clamp-to-one(t);
+                            }
+                        }
                     }
+                    Rectangle { horizontal-stretch: 1; }
                 }
 
                 HorizontalBox {

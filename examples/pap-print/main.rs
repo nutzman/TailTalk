@@ -1,8 +1,7 @@
 use clap::Parser;
 use tailtalk::{
     TalkStack,
-    atp::{Atp, AtpAddress},
-    pap::PapClient,
+    atp::AtpAddress,
 };
 use tailtalk_packets::nbp::EntityName;
 
@@ -40,10 +39,6 @@ async fn main() -> anyhow::Result<()> {
         .await
         .expect("failed to build AppleTalk stack");
 
-    // Two ATP sockets: one for sending requests, one for receiving printer-initiated ones
-    let (_req_sock, atp_requestor, _) = Atp::spawn(&stack.ddp, None).await;
-    let (_resp_sock, _, atp_responder) = Atp::spawn(&stack.ddp, None).await;
-
     // Locate the printer via NBP
     println!("Looking up printer '{}'...", entity);
     let tuples = stack.nbp.lookup(entity).await?;
@@ -64,8 +59,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Query status
     println!("Querying printer status...");
-    let status_requestor = atp_requestor.clone();
-    match PapClient::get_status(status_requestor, printer_addr).await {
+    match stack.pap_status(printer_addr).await {
         Ok(status) => println!("Printer status: '{}'", status),
         Err(e) => println!("Could not get status: {}", e),
     }
@@ -89,7 +83,7 @@ showpage
     };
 
     println!("Connecting to printer ({} bytes to send)...", data.len());
-    let mut client = PapClient::new(atp_requestor, atp_responder);
+    let mut client = stack.pap_client().await;
     client.connect(printer_addr).await?;
 
     println!("Printing...");
