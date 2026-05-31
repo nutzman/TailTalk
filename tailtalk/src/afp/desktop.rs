@@ -23,7 +23,9 @@ impl IconKey {
 
 pub struct DesktopDatabase {
     pub dt_ref_num: u16,
-    db: sled::Db,
+    icons: sled::Tree,
+    comments: sled::Tree,
+    appls: sled::Tree,
 }
 
 impl DesktopDatabase {
@@ -49,15 +51,27 @@ impl DesktopDatabase {
 
     /// Construct a `DesktopDatabase` from an already-open `sled::Db` handle.
     /// Use this to share a single DB handle across multiple AFP sessions.
-    pub fn from_db(db: sled::Db, dt_ref_num: u16) -> Self {
-        Self { dt_ref_num, db }
+    pub fn from_db(db: sled::Db, dt_ref_num: u16) -> Result<Self, AfpError> {
+        let icons = db.open_tree(b"icons").map_err(|e| {
+            error!("Failed to open 'icons' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+        let comments = db.open_tree(b"comments").map_err(|e| {
+            error!("Failed to open 'comments' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+        let appls = db.open_tree(b"appls").map_err(|e| {
+            error!("Failed to open 'appls' tree: {}", e);
+            AfpError::AccessDenied
+        })?;
+        Ok(Self { dt_ref_num, icons, comments, appls })
     }
 
     /// Open (or create) the desktop database at the standard path and wrap it.
     /// Prefer `open_or_create` + `from_db` when sharing across sessions.
     pub fn new(volume_root: &Path, dt_ref_num: u16) -> Result<Self, AfpError> {
         let db = Self::open_or_create(volume_root)?;
-        Ok(Self { dt_ref_num, db })
+        Self::from_db(db, dt_ref_num)
     }
 
     pub fn add_icon(
@@ -73,12 +87,7 @@ impl DesktopDatabase {
             icon_type,
         };
 
-        let tree = self.db.open_tree(b"icons").map_err(|e| {
-            error!("Failed to open 'icons' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
-        tree.insert(key.to_bytes(), icon_data).map_err(|e| {
+        self.icons.insert(key.to_bytes(), icon_data).map_err(|e| {
             error!("Failed to insert icon: {}", e);
             AfpError::AccessDenied
         })?;
@@ -90,6 +99,7 @@ impl DesktopDatabase {
         creator: [u8; 4],
         file_type: [u8; 4],
         icon_type: u8,
+        // AFP wire format includes an iconSize field; we store one copy per type and ignore it.
         _size: u16,
     ) -> Result<Vec<u8>, AfpError> {
         let key = IconKey {
@@ -98,12 +108,7 @@ impl DesktopDatabase {
             icon_type,
         };
 
-        let tree = self.db.open_tree(b"icons").map_err(|e| {
-            error!("Failed to open 'icons' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
-        if let Some(data) = tree.get(key.to_bytes()).map_err(|e| {
+        if let Some(data) = self.icons.get(key.to_bytes()).map_err(|e| {
             error!("Failed to get icon: {}", e);
             AfpError::AccessDenied
         })? {
@@ -117,12 +122,8 @@ impl DesktopDatabase {
         creator: [u8; 4],
         _icon_type: u16,
     ) -> Result<(u32, u32, u16), AfpError> {
-        // Since sqlite/sled stores the entire icon, we can iterate over the keys matching the creator
+        // Since sled stores the entire icon, we can iterate over the keys matching the creator
         // and find an icon type that matches the request. Or return basic size info.
-        let tree = self.db.open_tree(b"icons").map_err(|e| {
-            error!("Failed to open 'icons' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
 
         // Format is:
         // tag (4 bytes)
@@ -130,7 +131,7 @@ impl DesktopDatabase {
         // icon_type (1 byte, padding, or matching requested size)
         // size (2 bytes)
 
-        for result in tree.iter() {
+        for result in self.icons.iter() {
             if let Ok((key, value)) = result
                 && key.len() == 9
             {
@@ -156,13 +157,8 @@ impl DesktopDatabase {
     }
 
     pub fn set_comment(&self, rel_path: &std::path::Path, comment: &[u8]) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"comments").map_err(|e| {
-            error!("Failed to open 'comments' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let key = rel_path.to_string_lossy();
-        tree.insert(key.as_bytes(), comment).map_err(|e| {
+        self.comments.insert(key.as_bytes(), comment).map_err(|e| {
             error!("Failed to insert comment: {}", e);
             AfpError::AccessDenied
         })?;
@@ -176,14 +172,9 @@ impl DesktopDatabase {
     }
 
     pub fn get_comment(&self, rel_path: &std::path::Path) -> Result<Vec<u8>, AfpError> {
-        let tree = self.db.open_tree(b"comments").map_err(|e| {
-            error!("Failed to open 'comments' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         tracing::info!("Get comment for path {:?}", rel_path);
         let key = rel_path.to_string_lossy();
-        if let Some(data) = tree.get(key.as_bytes()).map_err(|e| {
+        if let Some(data) = self.comments.get(key.as_bytes()).map_err(|e| {
             error!("Failed to get comment: {}", e);
             AfpError::AccessDenied
         })? {
@@ -194,13 +185,8 @@ impl DesktopDatabase {
     }
 
     pub fn remove_comment(&self, rel_path: &std::path::Path) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"comments").map_err(|e| {
-            error!("Failed to open 'comments' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let key = rel_path.to_string_lossy();
-        tree.remove(key.as_bytes()).map_err(|e| {
+        self.comments.remove(key.as_bytes()).map_err(|e| {
             error!("Failed to remove comment: {}", e);
             AfpError::AccessDenied
         })?;
@@ -214,18 +200,13 @@ impl DesktopDatabase {
         old_path: &std::path::Path,
         new_path: &std::path::Path,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"comments").map_err(|e| {
-            error!("Failed to open 'comments' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let old_key = old_path.to_string_lossy();
-        if let Some(data) = tree.remove(old_key.as_bytes()).map_err(|e| {
+        if let Some(data) = self.comments.remove(old_key.as_bytes()).map_err(|e| {
             error!("Failed to remove old comment key: {}", e);
             AfpError::AccessDenied
         })? {
             let new_key = new_path.to_string_lossy();
-            tree.insert(new_key.as_bytes(), data).map_err(|e| {
+            self.comments.insert(new_key.as_bytes(), data).map_err(|e| {
                 error!("Failed to insert comment at new key: {}", e);
                 AfpError::AccessDenied
             })?;
@@ -240,18 +221,13 @@ impl DesktopDatabase {
         src_path: &std::path::Path,
         dst_path: &std::path::Path,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"comments").map_err(|e| {
-            error!("Failed to open 'comments' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let src_key = src_path.to_string_lossy();
-        if let Some(data) = tree.get(src_key.as_bytes()).map_err(|e| {
+        if let Some(data) = self.comments.get(src_key.as_bytes()).map_err(|e| {
             error!("Failed to read comment for copy: {}", e);
             AfpError::AccessDenied
         })? {
             let dst_key = dst_path.to_string_lossy();
-            tree.insert(dst_key.as_bytes(), data).map_err(|e| {
+            self.comments.insert(dst_key.as_bytes(), data).map_err(|e| {
                 error!("Failed to insert copied comment: {}", e);
                 AfpError::AccessDenied
             })?;
@@ -268,15 +244,10 @@ impl DesktopDatabase {
         old_dir_id: u32,
         new_dir_id: u32,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let old_dir_bytes = old_dir_id.to_be_bytes();
         let old_path_bytes = old_path.as_bytes();
 
-        let matches: Vec<(sled::IVec, sled::IVec)> = tree
+        let matches: Vec<(sled::IVec, sled::IVec)> = self.appls
             .iter()
             .filter_map(|r| r.ok())
             .filter(|(_, v)| {
@@ -296,7 +267,7 @@ impl DesktopDatabase {
             value.extend_from_slice(&new_dir_bytes);
             value.push(new_path_bytes.len() as u8);
             value.extend_from_slice(new_path_bytes);
-            tree.insert(key, value).map_err(|e| {
+            self.appls.insert(key, value).map_err(|e| {
                 error!("Failed to update APPL path: {}", e);
                 AfpError::AccessDenied
             })?;
@@ -313,15 +284,10 @@ impl DesktopDatabase {
         src_dir_id: u32,
         dst_dir_id: u32,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let src_dir_bytes = src_dir_id.to_be_bytes();
         let src_path_bytes = src_path.as_bytes();
 
-        let matches: Vec<(sled::IVec, sled::IVec)> = tree
+        let matches: Vec<(sled::IVec, sled::IVec)> = self.appls
             .iter()
             .filter_map(|r| r.ok())
             .filter(|(_, v)| {
@@ -341,7 +307,7 @@ impl DesktopDatabase {
             value.extend_from_slice(&dst_dir_bytes);
             value.push(dst_path_bytes.len() as u8);
             value.extend_from_slice(dst_path_bytes);
-            tree.insert(key, value).map_err(|e| {
+            self.appls.insert(key, value).map_err(|e| {
                 error!("Failed to insert copied APPL: {}", e);
                 AfpError::AccessDenied
             })?;
@@ -352,15 +318,10 @@ impl DesktopDatabase {
     /// Remove all APPL entries whose stored path matches `path` and directory ID matches
     /// `dir_id`. Used when a file is deleted. Silently succeeds if no match exists.
     pub fn delete_appls_for_path(&self, dir_id: u32, path: &str) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let dir_bytes = dir_id.to_be_bytes();
         let path_bytes = path.as_bytes();
 
-        let keys: Vec<sled::IVec> = tree
+        let keys: Vec<sled::IVec> = self.appls
             .iter()
             .filter_map(|r| r.ok())
             .filter(|(_, v)| {
@@ -375,7 +336,7 @@ impl DesktopDatabase {
             .collect();
 
         for key in keys {
-            tree.remove(key).map_err(|e| {
+            self.appls.remove(key).map_err(|e| {
                 error!("Failed to remove APPL entry: {}", e);
                 AfpError::AccessDenied
             })?;
@@ -394,22 +355,20 @@ impl DesktopDatabase {
         directory_id: u32,
         path: &str,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let mut key = [0u8; 8];
         key[0..4].copy_from_slice(&creator);
         key[4..8].copy_from_slice(&tag.to_be_bytes());
 
         let path_bytes = path.as_bytes();
+        if path_bytes.len() > 255 {
+            return Err(AfpError::ParamError);
+        }
         let mut value = Vec::with_capacity(5 + path_bytes.len());
         value.extend_from_slice(&directory_id.to_be_bytes());
         value.push(path_bytes.len() as u8);
         value.extend_from_slice(path_bytes);
 
-        tree.insert(key, value).map_err(|e| {
+        self.appls.insert(key, value).map_err(|e| {
             error!("Failed to insert APPL: {}", e);
             AfpError::AccessDenied
         })?;
@@ -423,15 +382,10 @@ impl DesktopDatabase {
         directory_id: u32,
         path: &str,
     ) -> Result<(), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let dir_bytes = directory_id.to_be_bytes();
         let path_bytes = path.as_bytes();
 
-        for result in tree.scan_prefix(creator) {
+        for result in self.appls.scan_prefix(creator) {
             let (key, value) = result.map_err(|e| {
                 error!("Failed to scan APPLs: {}", e);
                 AfpError::AccessDenied
@@ -443,7 +397,7 @@ impl DesktopDatabase {
                     && value.len() >= 5 + path_len
                     && &value[5..5 + path_len] == path_bytes
                 {
-                    tree.remove(&key).map_err(|e| {
+                    self.appls.remove(&key).map_err(|e| {
                         error!("Failed to remove APPL: {}", e);
                         AfpError::AccessDenied
                     })?;
@@ -463,13 +417,8 @@ impl DesktopDatabase {
         creator: [u8; 4],
         index: u16,
     ) -> Result<(u32, u32, String), AfpError> {
-        let tree = self.db.open_tree(b"appls").map_err(|e| {
-            error!("Failed to open 'appls' tree: {}", e);
-            AfpError::AccessDenied
-        })?;
-
         let target = index.saturating_sub(1) as usize;
-        for (i, result) in tree.scan_prefix(creator).enumerate() {
+        for (i, result) in self.appls.scan_prefix(creator).enumerate() {
             let (key, value) = result.map_err(|e| {
                 error!("Failed to scan APPLs: {}", e);
                 AfpError::AccessDenied

@@ -7,7 +7,7 @@ use tailtalk_packets::aarp;
 use tailtalk_packets::ddp::DdpPacket;
 use tailtalk_packets::ethertalk::{EtherTalkPhase2Frame, EtherTalkPhase2Type};
 use tailtalk_packets::llap::{LlapPacket, LlapType};
-use tashtalk::{TashTalk, TashTalkError};
+use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 use futures::StreamExt;
@@ -286,6 +286,38 @@ fn spawn_pcap_writer(
     Some(tx)
 }
 
+// ── Ethernet framing helpers ──────────────────────────────────────────────────
+
+/// Write a 14-byte EtherTalk Phase 1 Ethernet header into `buf` and return 14.
+fn write_eth1_header(buf: &mut [u8], dst: [u8; 6], src: [u8; 6], ethertype: u16) -> usize {
+    buf[0..6].copy_from_slice(&dst);
+    buf[6..12].copy_from_slice(&src);
+    buf[12..14].copy_from_slice(&ethertype.to_be_bytes());
+    14
+}
+
+/// Write a 22-byte EtherTalk Phase 2 LLC/SNAP header into `buf` and return 22.
+///
+/// `oui` is the 3-byte SNAP OUI: `[0x08, 0x00, 0x07]` for AppleTalk DDP,
+/// `[0x00, 0x00, 0x00]` for AARP.
+fn write_snap_header(
+    buf: &mut [u8],
+    dst: [u8; 6],
+    src: [u8; 6],
+    oui: [u8; 3],
+    ethertype: u16,
+    payload_len: usize,
+) -> usize {
+    buf[0..6].copy_from_slice(&dst);
+    buf[6..12].copy_from_slice(&src);
+    let frame_len = 8 + payload_len; // 3 LLC + 5 SNAP bytes
+    buf[12..14].copy_from_slice(&(frame_len as u16).to_be_bytes());
+    buf[14..17].copy_from_slice(&[0xAA, 0xAA, 0x03]); // LLC DSAP, SSAP, Control
+    buf[17..20].copy_from_slice(&oui);
+    buf[20..22].copy_from_slice(&ethertype.to_be_bytes());
+    22
+}
+
 // ── PacketProcessor ───────────────────────────────────────────────────────────
 
 impl PacketProcessor {
@@ -483,7 +515,6 @@ impl PacketProcessor {
 
                 tracing::info!("Starting TashTalk async loop");
                 let _ = ready.send(true);
-                let mut last_receive_was_error = false;
                 loop {
                     tokio::select! {
                         _ = tash_token.cancelled() => break,
@@ -499,7 +530,6 @@ impl PacketProcessor {
                         res = tashtalk_instance.receive_frame() => {
                             match res {
                                 Ok(Some(data)) => {
-                                    last_receive_was_error = false;
                                     if let Some(ref tx) = pcap_rx_sender {
                                         let _ = tx.try_send((SystemTime::now(), data.clone()));
                                     }
@@ -552,26 +582,10 @@ impl PacketProcessor {
                                         }
                                     }
                                 }
-                                Ok(None) => {
-                                    // tokio-util emits one None after every decode error as a
-                                    // recovery artifact; only treat None as real EOF otherwise.
-                                    if last_receive_was_error {
-                                        last_receive_was_error = false;
-                                        continue;
-                                    }
-                                    break;
-                                }
+                                Ok(None) => break,
                                 Err(e) => {
-                                    last_receive_was_error = true;
-                                    tracing::error!("TashTalk receive error: {:?}", e);
-                                    if !matches!(e,
-                                        TashTalkError::FramingError
-                                        | TashTalkError::FrameAborted
-                                        | TashTalkError::CrcCheckFailed
-                                        | TashTalkError::UnknownEscape(_)
-                                    ) {
-                                        break;
-                                    }
+                                    tracing::error!("TashTalk I/O error: {:?}", e);
+                                    break;
                                 }
                             }
                         }
@@ -608,36 +622,21 @@ impl PacketProcessor {
                 DataLinkProtocol::Ddp => {
                     match pkt.dest_node {
                         addressing::Node::EtherTalkPhase1(mac) => {
-                            output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&our_mac);
-                            output_buf[12] = 0x80;
-                            output_buf[13] = 0x9B;
-                            let dst_node = if pkt.payload.len() > 8 { pkt.payload[8] } else { 0 };
-                            let src_node = if pkt.payload.len() > 9 { pkt.payload[9] } else { 0 };
-                            output_buf[14] = dst_node;
-                            output_buf[15] = src_node;
-                            output_buf[16] = 2;
                             let payload_len = pkt.payload.len();
-                            output_buf[17..17 + payload_len].copy_from_slice(&pkt.payload);
-                            17 + payload_len
+                            let n = write_eth1_header(&mut output_buf, mac, our_mac, 0x809B);
+                            // Phase 1 DDP: 3-byte LLAP header (dst, src, type=2) precedes the DDP packet.
+                            // Node numbers are extracted from the DDP header bytes 8 and 9.
+                            output_buf[n] = if payload_len > 8 { pkt.payload[8] } else { 0 };
+                            output_buf[n + 1] = if payload_len > 9 { pkt.payload[9] } else { 0 };
+                            output_buf[n + 2] = 2;
+                            output_buf[n + 3..n + 3 + payload_len].copy_from_slice(&pkt.payload);
+                            n + 3 + payload_len
                         }
                         addressing::Node::EtherTalkPhase2(mac) => {
-                            output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&our_mac);
                             let payload_len = pkt.payload.len();
-                            let total_payload = 8 + payload_len;
-                            output_buf[12] = (total_payload >> 8) as u8;
-                            output_buf[13] = (total_payload & 0xFF) as u8;
-                            output_buf[14] = 0xAA;
-                            output_buf[15] = 0xAA;
-                            output_buf[16] = 0x03;
-                            output_buf[17] = 0x08;
-                            output_buf[18] = 0x00;
-                            output_buf[19] = 0x07;
-                            output_buf[20] = 0x80;
-                            output_buf[21] = 0x9B;
-                            output_buf[22..22 + payload_len].copy_from_slice(&pkt.payload);
-                            14 + total_payload
+                            let n = write_snap_header(&mut output_buf, mac, our_mac, [0x08, 0x00, 0x07], 0x809B, payload_len);
+                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
+                            n + payload_len
                         }
                         addressing::Node::LocalTalk(node_id) => {
                             let llap_pkt = LlapPacket {
@@ -690,29 +689,14 @@ impl PacketProcessor {
                     let payload_len = pkt.payload.len();
                     match pkt.dest_node {
                         addressing::Node::EtherTalkPhase1(mac) => {
-                            output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&our_mac);
-                            output_buf[12] = 0x80;
-                            output_buf[13] = 0xF3;
-                            output_buf[14..14 + payload_len].copy_from_slice(&pkt.payload);
-                            14 + payload_len
+                            let n = write_eth1_header(&mut output_buf, mac, our_mac, 0x80F3);
+                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
+                            n + payload_len
                         }
                         addressing::Node::EtherTalkPhase2(mac) => {
-                            output_buf[0..6].copy_from_slice(&mac);
-                            output_buf[6..12].copy_from_slice(&our_mac);
-                            let total_payload = 8 + payload_len;
-                            output_buf[12] = (total_payload >> 8) as u8;
-                            output_buf[13] = (total_payload & 0xFF) as u8;
-                            output_buf[14] = 0xAA;
-                            output_buf[15] = 0xAA;
-                            output_buf[16] = 0x03;
-                            output_buf[17] = 0x00;
-                            output_buf[18] = 0x00;
-                            output_buf[19] = 0x00;
-                            output_buf[20] = 0x80;
-                            output_buf[21] = 0xF3;
-                            output_buf[22..22 + payload_len].copy_from_slice(&pkt.payload);
-                            14 + total_payload
+                            let n = write_snap_header(&mut output_buf, mac, our_mac, [0x00, 0x00, 0x00], 0x80F3, payload_len);
+                            output_buf[n..n + payload_len].copy_from_slice(&pkt.payload);
+                            n + payload_len
                         }
                         addressing::Node::LocalTalk(_) => 0,
                     }
@@ -804,14 +788,14 @@ impl ShutdownHandle {
 /// Obtain one via [`TalkStack::builder`]. Once built, spawn services on top:
 ///
 /// ```no_run
-/// # use tailtalk::{TalkStack, afp::{AfpServer, AfpServerConfig}};
+/// # use tailtalk::{TalkStack, afp::AfpServerConfig};
 /// # async fn example() -> anyhow::Result<()> {
 /// let stack = TalkStack::builder()
 ///     .ethernet("eth0")
 ///     .build()
 ///     .await?;
 ///
-/// let _afp = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), AfpServerConfig::default(), stack.token(), stack.services_done_token()).await?;
+/// let _afp = stack.spawn_afp(Some(254), AfpServerConfig::default()).await?;
 /// # Ok(()) }
 /// ```
 pub struct TalkStack {
@@ -857,6 +841,44 @@ impl TalkStack {
     /// completion of their shutdown sequence.
     pub fn services_done_token(&self) -> CancellationToken {
         self.services_done.clone()
+    }
+
+    /// Start an AFP file server on this stack.
+    pub async fn spawn_afp(&self, socket: Option<u8>, config: afp::AfpServerConfig) -> anyhow::Result<afp::AfpServer> {
+        afp::AfpServer::spawn(&self.ddp, &self.nbp, socket, config, self.service_token.clone(), self.services_done.clone()).await
+    }
+
+    /// Bind an ASP listener on this stack.
+    pub async fn listen_asp(
+        &self,
+        socket: Option<u8>,
+        entity_name: tailtalk_packets::nbp::EntityName,
+        status_data: Vec<u8>,
+    ) -> anyhow::Result<asp::AspHandle> {
+        asp::Asp::bind(&self.ddp, &self.nbp, socket, entity_name, status_data, self.service_token.clone(), self.services_done.clone()).await
+    }
+
+    /// Bind an ADSP listener.
+    pub async fn listen_adsp(&self, socket: Option<u8>) -> std::io::Result<(u8, adsp::AdspListener)> {
+        adsp::Adsp::bind(&self.ddp, socket).await
+    }
+
+    /// Open an outbound ADSP connection.
+    pub async fn connect_adsp(&self, remote_addr: adsp::AdspAddress) -> std::io::Result<adsp::AdspStream> {
+        adsp::Adsp::connect(&self.ddp, remote_addr).await
+    }
+
+    /// Create a PAP client backed by two fresh ATP sockets.
+    pub async fn pap_client(&self) -> pap::PapClient {
+        let (_, atp_requestor, _) = atp::Atp::spawn(&self.ddp, None).await;
+        let (_, _, atp_responder) = atp::Atp::spawn(&self.ddp, None).await;
+        pap::PapClient::new(atp_requestor, atp_responder)
+    }
+
+    /// Query the status string of a PAP printer without opening a full connection.
+    pub async fn pap_status(&self, address: atp::AtpAddress) -> anyhow::Result<String> {
+        let (_, atp_requestor, _) = atp::Atp::spawn(&self.ddp, None).await;
+        pap::PapClient::get_status(atp_requestor, address).await
     }
 }
 

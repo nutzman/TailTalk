@@ -1,7 +1,7 @@
 use clap::Parser;
 use tailtalk::{
     TalkStack,
-    adsp::{Adsp, AdspAddress},
+    adsp::AdspAddress,
     stylewriter::StyleWriterEncoder,
 };
 use tailtalk_packets::nbp::EntityName;
@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let planar_scanline_len = width_pixels / 8;
 
     println!("Connecting ADSP session to printer...");
-    let mut adsp_stream = Adsp::connect(&stack.ddp, printer_addr).await?;
+    let mut adsp_stream = stack.connect_adsp(printer_addr).await?;
     println!("ADSP session established!");
 
     // Send the initialization boundaries

@@ -2,7 +2,7 @@ use clap::Parser;
 use std::path::PathBuf;
 use tailtalk::{
     TalkStack,
-    afp::{AfpServer, AfpServerConfig},
+    afp::AfpServerConfig,
 };
 
 #[derive(Parser, Debug)]
@@ -51,7 +51,7 @@ async fn main() {
         ..AfpServerConfig::default()
     };
 
-    let _afp_server = AfpServer::spawn(&stack.ddp, &stack.nbp, Some(254), afp_config, stack.token(), stack.services_done_token())
+    let _afp_server = stack.spawn_afp(Some(254), afp_config)
         .await
         .expect("failed to spawn AFP server");
 

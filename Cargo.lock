@@ -5531,7 +5531,6 @@ dependencies = [
  "mac_address",
  "magic-db",
  "pcap",
- "pure-magic",
  "rand",
  "sled",
  "tailtalk-packets",
@@ -5601,6 +5600,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

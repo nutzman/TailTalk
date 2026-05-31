@@ -41,11 +41,29 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
         "application/x-stuffit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
         // StuffIt SEA (Self-Extracting Archive): APPL type as it is a standalone executable
         "application/x-stuffit-x" => Some(TypeCreator { file_type: *b"APPL", creator: *b"aust" }),
-        "application/x-apple-diskimage" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
+        "application/x-dc42-floppy-image" => Some(TypeCreator { file_type: *b"dImg", creator: *b"dCpy" }),
         // PDF: type 'PDF ' (with trailing space), creator 'CARO' (Adobe Acrobat)
         "application/pdf" => Some(TypeCreator { file_type: *b"PDF ", creator: *b"CARO" }),
         // BinHex 4.0: type 'TEXT', creator 'BnHq' (BinHex utility)
         "application/mac-binhex40" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"BnHq" }),
+        // BinHex 1.0/2.0 (pre-4.0): same encoding family, creator 'BNHQ'
+        "application/mac-binhex" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"BNHQ" }),
+        // Apple Disk Image (DMG/HFS raw): type/creator from magic-db !:apple ????devi
+        "application/x-apple-diskimage" => Some(TypeCreator { file_type: *b"devi", creator: *b"????" }),
+        // MacBinary I/II/III wrapper: type/creator from magic-db !:apple PSPTBINA
+        "application/x-macbinary" => Some(TypeCreator { file_type: *b"BINA", creator: *b"PSPT" }),
+        // Datafork TrueType/suitcase font
+        "application/x-dfont" => Some(TypeCreator { file_type: *b"dfil", creator: *b"????" }),
+        // HFS/HFS+ resource fork suitcase
+        "application/x-apple-rsr" => Some(TypeCreator { file_type: *b"rsrc", creator: *b"????" }),
+        // AppleWorks 3 word processor (Apple II/ProDOS)
+        "application/x-appleworks3" => Some(TypeCreator { file_type: *b"AWWP", creator: *b"pdos" }),
+        // JPEG: type/creator from magic-db !:apple 8BIMJPEG
+        "image/jpeg" => Some(TypeCreator { file_type: *b"JPEG", creator: *b"8BIM" }),
+        // PNG: no !:apple in magic-db; PNGf is the conventional Classic Mac type
+        "image/png" => Some(TypeCreator { file_type: *b"PNGf", creator: *b"????" }),
+        // PICT: type/creator from magic-db !:apple ????PICT
+        "image/x-pict" => Some(TypeCreator { file_type: *b"PICT", creator: *b"ttxt" }),
         _ => None,
     }
 }
@@ -53,8 +71,19 @@ fn infer_type_creator_from_content(path: &Path) -> Option<TypeCreator> {
 /// Returns the `TypeCreator` by file extension alone, as a fallback when magic
 /// byte probing fails or returns an unrecognised MIME type.
 fn infer_type_creator_from_extension(path: &Path) -> Option<TypeCreator> {
-    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
-    match ext.as_str() {
+    let stem = path.file_stem().and_then(|s| s.to_str());
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase());
+
+    // MPW Shell conventions (creator 'MPS ')
+    // .π extension: 68k MPW Tool; π.rsrc: companion resource fork file
+    if ext.as_deref() == Some("π") {
+        return Some(TypeCreator { file_type: *b"MPST", creator: *b"MPS " });
+    }
+    if ext.as_deref() == Some("rsrc") && stem.is_some_and(|s| s.ends_with(".π")) {
+        return Some(TypeCreator { file_type: *b"rsrc", creator: *b"MPS " });
+    }
+
+    match ext.as_deref()? {
         "txt" => Some(TypeCreator { file_type: *b"TEXT", creator: *b"ttxt" }),
         "sit" => Some(TypeCreator { file_type: *b"SIT!", creator: *b"SIT!" }),
         "sea" => Some(TypeCreator { file_type: *b"APPL", creator: *b"aust" }),
@@ -376,7 +405,7 @@ async fn resolve_resource_fork_path(volume_root: &Path, relative_path: &Path) ->
         {
             return (sidecar, meta.len() as u32);
         }
-        return (native, 0);
+        (native, 0)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1268,7 +1297,7 @@ impl Volume {
             let _ = tokio::fs::create_dir(&apple_desktop).await;
         }
 
-        let desktop_db = crate::afp::DesktopDatabase::from_db(db, 1);
+        let desktop_db = crate::afp::DesktopDatabase::from_db(db, 1)?;
         let ref_num = desktop_db.dt_ref_num;
         self.desktop_database = Some(desktop_db);
         Ok(ref_num)
@@ -3199,7 +3228,7 @@ mod tests {
         // Query the DB directly via the shared handle — the file node is gone so
         // we can't go via resolve_node, and no drop/reopen is needed.
         assert_eq!(
-            crate::afp::DesktopDatabase::from_db(shared_db, 1)
+            crate::afp::DesktopDatabase::from_db(shared_db, 1).unwrap()
                 .get_comment(std::path::Path::new("doomed.txt")),
             Err(AfpError::ItemNotFound),
             "comment should have been deleted with the file"
