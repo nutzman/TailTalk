@@ -1,4 +1,5 @@
 use bitflags::bitflags;
+use encoding_rs::MACINTOSH;
 
 bitflags! {
     /// Bitmap of requested volume information. One or more of these can be set in a request
@@ -158,8 +159,9 @@ impl FPDirectoryBitmap {
         offset
     }
 
-    pub fn response_len(&self, name_len: usize) -> usize {
-        self.long_name_offset() + name_len + 1
+    pub fn response_len(&self, name: &str) -> usize {
+        let mac_name_len = MACINTOSH.encode(name).0.len().min(255);
+        self.long_name_offset() + mac_name_len + 1
     }
 }
 
@@ -241,8 +243,9 @@ impl FPFileBitmap {
         offset
     }
 
-    pub fn response_len(&self, name_len: usize) -> usize {
-        self.long_name_offset() + name_len + 1
+    pub fn response_len(&self, name: &str) -> usize {
+        let mac_name_len = MACINTOSH.encode(name).0.len().min(255);
+        self.long_name_offset() + mac_name_len + 1
     }
 }
 

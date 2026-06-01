@@ -1602,10 +1602,12 @@ impl Volume {
             }
             let mut entry_offset = offset;
 
+            let afp_name = posix_name_to_afp(name);
+
             if *is_dir {
                 let mut pad_byte = false;
                 let mut directory_bitmap_len =
-                    enumerate_cmd.directory_bitmap.response_len(name.len());
+                    enumerate_cmd.directory_bitmap.response_len(&afp_name);
                 if !directory_bitmap_len.is_multiple_of(2) {
                     directory_bitmap_len += 1;
                     pad_byte = true;
@@ -1649,7 +1651,7 @@ impl Volume {
                 }
             } else {
                 let mut pad_byte = false;
-                let mut file_bitmap_len = enumerate_cmd.file_bitmap.response_len(name.len());
+                let mut file_bitmap_len = enumerate_cmd.file_bitmap.response_len(&afp_name);
                 if !file_bitmap_len.is_multiple_of(2) {
                     file_bitmap_len += 1;
                     pad_byte = true;
