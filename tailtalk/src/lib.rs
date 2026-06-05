@@ -1,5 +1,4 @@
 use anyhow::Error;
-use mac_address::mac_address_by_name;
 use rand::Rng;
 use std::path::PathBuf;
 use std::time::SystemTime;
@@ -11,6 +10,13 @@ use tashtalk::TashTalk;
 use tokio::sync::mpsc;
 use tokio_serial::SerialPortBuilderExt;
 use futures::StreamExt;
+
+#[cfg(not(target_os = "windows"))]
+use mac_address::mac_address_by_name;
+
+#[cfg(target_os = "windows")]
+use get_adapters_addresses::{AdaptersAddresses, Family, Flags};
+
 pub use tokio_util::sync::CancellationToken;
 
 pub use tashtalk::TashTalkFeatures;
@@ -162,33 +168,95 @@ impl PacketProcessorBuilder {
         let mut pcap_rx: Option<pcap::Capture<pcap::Active>> = None;
         let mut pcap_tx: Option<pcap::Capture<pcap::Active>> = None;
         let mut our_mac: Option<[u8; 6]> = None;
+        let mac: String;
+
+        #[cfg(target_os = "windows")]
+        let device_description: Option<String>;
 
         // ── EtherTalk setup ──────────────────────────────────────────────────
         if let Some(ref intf) = self.ethernet_intf {
-            // Retrieve the interface MAC address cross-platform.
-            let mac = mac_address_by_name(intf)?
-                .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
-            our_mac = Some(mac.bytes());
+  
+
+            #[cfg(target_os = "windows")]
+            {
+                let intf_str = std::ffi::OsStr::new(intf);
+
+                let adapter_addresses = AdaptersAddresses::try_new(Family::Unspec, *Flags::default().include_all_interfaces())?;
+                let adt = adapter_addresses.iter().find( |a| a.friendly_name() == intf_str ).ok_or_else(|| anyhow::anyhow!("Failed to get interfaces '{}'", intf))?;
+
+                //let intf_friendly_name = adt.friendly_name().to_str();
+                device_description = match  adt.description().into_string() {
+                    Ok(s) => Some(s),
+                    Err(e) => panic!("Cannot get description of adapater {e:?}")
+                };
+                // Convert representation so that PCAP filter works
+                mac = adt.physical_address().unwrap().to_string().replace("-",":");
+                // Grab MAC Address for future use
+                let t = adt.physical_address().expect("MAC Address missing").as_u64().to_le_bytes();
+                our_mac = Some(t[0..6].try_into().unwrap());
+
+ 
+            }
+
+            #[cfg(not(target_os = "windows"))]
+            {
+                // Retrieve the interface MAC address linux/mac
+                let t = mac_address_by_name(intf)?
+                    .ok_or_else(|| anyhow::anyhow!("no MAC address found for interface {}", intf))?;
+                our_mac = Some(t.bytes());
+                mac = t.to_string();
+            }
 
             // BPF filter: Phase 1 AppleTalk (0x809B), Phase 1 AARP (0x80F3),
             // and any IEEE 802.2 LLC/SNAP frame (length field ≤ 1500) for Phase 2.
             let filter = format!("(ether proto 0x809B or ether proto 0x80F3 or (ether[12:2] <= 1500)) and not ether src {mac}");
 
             tracing::info!("filter string: {filter}");
-            // RX capture – promiscuous mode, filter applied.
-            let mut rx = pcap::Capture::from_device(intf.as_str())?
-                .promisc(true)
-                .immediate_mode(true)
-                .open()?;
-            rx.filter(&filter, true)?;
 
-            pcap_rx = Some(rx);
+            #[cfg(target_os = "windows")]
+            {
 
-            // TX capture – separate handle used solely for packet injection.
-            let tx = pcap::Capture::from_device(intf.as_str())?
-                .promisc(true)
-                .open()?;
-            pcap_tx = Some(tx);
+                let devices = pcap::Device::list()?;
+                let device = devices.into_iter().find(|dev| dev.desc == device_description ) ;
+
+                tracing::info!("device {:?}", device );
+
+                let d1 = device.clone().unwrap();
+                let d2 = device.unwrap();
+
+                // RX capture – promiscuous mode, filter applied.
+                let mut rx = pcap::Capture::from_device( d1 ) ?
+                    .promisc(true)
+                    .immediate_mode(true)
+                    .open()?;
+                rx.filter(&filter, true)?;
+
+                pcap_rx = Some(rx);
+
+                // TX capture – separate handle used solely for packet injection.
+                let tx = pcap::Capture::from_device( d2 )?
+                    .promisc(true)
+                    .open()?;
+                pcap_tx = Some(tx);
+        
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                // RX capture – promiscuous mode, filter applied.
+                let mut rx = pcap::Capture::from_device( intf.as_str() ) ?
+                    .promisc(true)
+                    .immediate_mode(true)
+                    .open()?;
+                rx.filter(&filter, true)?;
+
+                pcap_rx = Some(rx);
+
+                // TX capture – separate handle used solely for packet injection.
+                let tx = pcap::Capture::from_device( intf.as_str() )?
+                    .promisc(true)
+                    .open()?;
+                pcap_tx = Some(tx);
+            }
 
             tracing::info!("EtherTalk pcap captures opened on {}", intf);
         }

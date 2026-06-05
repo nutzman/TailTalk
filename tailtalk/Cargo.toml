@@ -33,6 +33,10 @@ tokio-util = { version = "0.7.12", features = ["codec"] }
 tracing = { workspace = true } #unified
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 
+[target.'cfg(windows)'.dependencies]
+get_adapters_addresses.workspace = true
+
+
 [target.'cfg(unix)'.dependencies]
 xattr = "1.3.1"
 

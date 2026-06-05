@@ -27,6 +27,7 @@ tashtalk = { path = "tashtalk", version = "^0.2" } #unified
 thiserror = "^1.0.69" #unified
 tokio = { version = "^1.51.1", features = ["full", "io-util"] } #unified
 tracing = "^0.1.44" #unified
+get_adapters_addresses = "0.1.1" #unified
 
 [workspace.package]
 version = "0.4.5"
