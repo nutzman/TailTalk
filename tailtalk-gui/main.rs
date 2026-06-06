@@ -498,12 +498,52 @@ fn main() -> anyhow::Result<()> {
             };
             let sit_path = handle.path().to_path_buf();
 
-            match extract_sit(&sit_path, &volume_path).await {
-                Ok(count) => show_info(
-                    ui_weak,
-                    format!("Extracted {count} file(s) from the archive successfully."),
-                ),
-                Err(e) => show_error(ui_weak, e),
+            {
+                let ui_weak = ui_weak.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_import_progress_value(0.0);
+                        ui.set_import_progress_label("Starting…".into());
+                        ui.set_import_progress_visible(true);
+                    }
+                })
+                .ok();
+            }
+
+            let ui_progress = ui_weak.clone();
+            let result = extract_sit(&sit_path, &volume_path, move |done, total| {
+                let ui_weak = ui_progress.clone();
+                slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui_weak.upgrade() {
+                        ui.set_import_progress_value(done as f32 / total as f32);
+                        ui.set_import_progress_label(format!("{done} of {total}").into());
+                    }
+                })
+                .ok();
+            })
+            .await;
+
+            match result {
+                Ok(count) => {
+                    let msg =
+                        format!("Extracted {count} file(s) from the archive successfully.");
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_import_progress_visible(false);
+                            ui.set_info_message(msg.into());
+                        }
+                    })
+                    .ok();
+                }
+                Err(e) => {
+                    slint::invoke_from_event_loop(move || {
+                        if let Some(ui) = ui_weak.upgrade() {
+                            ui.set_import_progress_visible(false);
+                            ui.set_error_message(e.into());
+                        }
+                    })
+                    .ok();
+                }
             }
         });
     });
@@ -1065,7 +1105,11 @@ fn register_appl_from_resource_fork(
 
 /// Extract a StuffIt archive into `volume_path`, placing resource fork sidecars
 /// under `<volume_path>/.tailtalk/rsrc/<relative_path>` to match TailTalk's layout.
-async fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, String> {
+async fn extract_sit(
+    sit_path: &Path,
+    volume_path: &Path,
+    on_progress: impl Fn(usize, usize),
+) -> Result<usize, String> {
     let bytes = tokio::fs::read(sit_path).await
         .map_err(|e| format!("Failed to read archive: {e}"))?;
 
@@ -1079,8 +1123,10 @@ async fn extract_sit(sit_path: &Path, volume_path: &Path) -> Result<usize, Strin
     let mut deferred_icon_cr: Vec<(PathBuf, Vec<u8>)> = Vec::new();
 
     let mut file_count = 0usize;
+    let total_entries = archive.entries.len();
 
-    for entry in &archive.entries {
+    for (idx, entry) in archive.entries.iter().enumerate() {
+        on_progress(idx, total_entries);
         // Build a sanitized relative path: skip empty/`.`/`..` components.
         let rel: PathBuf = entry.name
             .split('/')

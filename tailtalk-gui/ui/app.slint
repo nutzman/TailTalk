@@ -1,4 +1,4 @@
-import { Button, ComboBox, LineEdit, HorizontalBox, VerticalBox, CheckBox, Palette } from "std-widgets.slint";
+import { Button, ComboBox, LineEdit, HorizontalBox, VerticalBox, CheckBox, Palette, ProgressIndicator } from "std-widgets.slint";
 
 export component AppWindow inherits Window {
     title: "TailTalk AFP Server";
@@ -23,6 +23,10 @@ export component AppWindow inherits Window {
     in-out property <bool> pcap-enabled: false;
     in-out property <string> pcap-path;
     in-out property <string> info-message: "";
+
+    in-out property <bool> import-progress-visible: false;
+    in-out property <float> import-progress-value: 0;
+    in-out property <string> import-progress-label: "";
 
     in-out property <bool> finder-info-visible: false;
     in-out property <string> finder-info-path: "";
@@ -393,6 +397,50 @@ export component AppWindow inherits Window {
                         text: "Save";
                         clicked => { root.save-finder-info(); }
                     }
+                }
+            }
+        }
+    }
+
+    // Import progress dialog — shown while a StuffIt or HFS extraction is running
+    if root.import-progress-visible : Rectangle {
+        x: 0; y: 0;
+        width: root.width;
+        height: root.height;
+        background: rgba(0, 0, 0, 0.45);
+
+        Rectangle {
+            width: 360px;
+            height: import-progress-content.preferred-height;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #f5f5f5;
+            border-radius: 8px;
+            drop-shadow-blur: 20px;
+            drop-shadow-color: rgba(0, 0, 0, 0.35);
+
+            import-progress-content := VerticalBox {
+                padding: 20px;
+                spacing: 14px;
+
+                Text {
+                    text: "Importing…";
+                    font-size: 15px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    color: #1a1a1a;
+                }
+
+                ProgressIndicator {
+                    progress: root.import-progress-value;
+                    min-width: 300px;
+                }
+
+                Text {
+                    text: root.import-progress-label;
+                    horizontal-alignment: center;
+                    color: #555555;
+                    font-size: 12px;
                 }
             }
         }
