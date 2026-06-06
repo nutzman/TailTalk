@@ -218,6 +218,9 @@ jobs:
         files: dist/*.dmg
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build release (Windows)
+      if: matrix.os == 'windows-latest'
+      run: cargo build --release -p tailtalk-gui
     - name: Build NSIS installer (Windows)
       if: matrix.os == 'windows-latest'
       run: cargo packager --release -f nsis -p tailtalk-gui
