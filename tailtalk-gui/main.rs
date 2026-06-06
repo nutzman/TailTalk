@@ -477,20 +477,10 @@ fn main() -> anyhow::Result<()> {
         let ui_weak = ui_weak.clone();
         let rt_handle_sit = rt_handle_sit.clone();
 
-        let (volume_path, is_running) = {
+        let volume_path = {
             let Some(ui) = ui_weak.upgrade() else { return };
-            (PathBuf::from(ui.get_volume_path().as_str()), ui.get_running())
+            PathBuf::from(ui.get_volume_path().as_str())
         };
-
-        if is_running {
-            show_error(
-                ui_weak,
-                "Please stop the AFP server before importing an archive.\n\
-                 Importing while the server is running may corrupt the desktop database."
-                    .to_string(),
-            );
-            return;
-        }
 
         if volume_path.as_os_str().is_empty() {
             show_error(ui_weak, "Please set a volume path before importing.".to_string());
@@ -524,20 +514,10 @@ fn main() -> anyhow::Result<()> {
         let ui_weak = ui_weak.clone();
         let rt_handle_hfs = rt_handle_hfs.clone();
 
-        let (volume_path, is_running) = {
+        let volume_path = {
             let Some(ui) = ui_weak.upgrade() else { return };
-            (PathBuf::from(ui.get_volume_path().as_str()), ui.get_running())
+            PathBuf::from(ui.get_volume_path().as_str())
         };
-
-        if is_running {
-            show_error(
-                ui_weak,
-                "Please stop the AFP server before importing a disk image.\n\
-                 Importing while the server is running may corrupt the desktop database."
-                    .to_string(),
-            );
-            return;
-        }
 
         if volume_path.as_os_str().is_empty() {
             show_error(ui_weak, "Please set a volume path before importing.".to_string());
