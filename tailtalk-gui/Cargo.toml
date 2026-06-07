@@ -46,7 +46,7 @@ path = "tailtalk-gui"
 main = true
 
 [package.metadata.packager.macos]
-minimum_system_version = "11.0"
+minimum_system_version = "10.12"
 info_plist_path = "Info.plist"
 
 [package.metadata.packager.dmg]
