@@ -930,6 +930,7 @@ pub struct TalkStackBuilder {
     localtalk_serial_path: Option<String>,
     tashtalk_features: tashtalk::TashTalkFeatures,
     fixed_addr: Option<tailtalk_packets::aarp::AppleTalkAddress>,
+    lt_fixed_node: Option<u8>,
     pcap_path: Option<PathBuf>,
 }
 
@@ -940,6 +941,7 @@ impl TalkStack {
             localtalk_serial_path: None,
             tashtalk_features: tashtalk::TashTalkFeatures::new(),
             fixed_addr: None,
+            lt_fixed_node: None,
             pcap_path: None,
         }
     }
@@ -972,7 +974,15 @@ impl TalkStackBuilder {
         self
     }
 
-    /// Use a fixed AppleTalk address instead of probing via AARP.
+    /// Use a fixed AppleTalk node on LocalTalk instead of probing via LLAP ENQ.
+    ///
+    /// The network number is always 0 on LocalTalk and cannot be configured.
+    pub fn localtalk_fixed_address(mut self, node: u8) -> Self {
+        self.lt_fixed_node = Some(node);
+        self
+    }
+
+    /// Use a fixed AppleTalk address on EtherTalk instead of probing via AARP.
     pub fn fixed_address(mut self, network: u16, node: u8) -> Self {
         self.fixed_addr = Some(tailtalk_packets::aarp::AppleTalkAddress {
             network_number: network,
@@ -1010,13 +1020,10 @@ impl TalkStackBuilder {
             None
         };
 
-        // LocalTalk addressing: always a fixed random address on network 0.
-        // LocalTalk short-DDP carries no network number (implying 0), so we
-        // must stay on network 0 to keep addresses consistent end-to-end.
         let lt_addressing = if self.localtalk_serial_path.is_some() {
-            let lt_fixed = Some(tailtalk_packets::aarp::AppleTalkAddress {
+            let lt_fixed = self.lt_fixed_node.map(|node| tailtalk_packets::aarp::AppleTalkAddress {
                 network_number: 0,
-                node_number: rand::rng().random_range(1..=253u8),
+                node_number: node,
             });
             Some(addressing::Addressing::spawn(
                 None,
