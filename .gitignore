@@ -3,3 +3,4 @@
 *.pcap
 .DS_Store
 .vscode/launch.json
+*.pcapng

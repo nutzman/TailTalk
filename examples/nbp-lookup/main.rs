@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 use tailtalk::TalkStack;
 use tailtalk_packets::nbp::EntityName;
@@ -20,7 +22,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt().init();
+    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
 
     let args = Args::parse();
 
@@ -39,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
         builder = builder.ethernet(intf);
     }
     if let Some(ref tty) = args.tashtalk {
-        builder = builder.localtalk(tty);
+        builder = builder.localtalk(tty).pcap_capture(PathBuf::from("capture"));
     }
     let stack = builder.build().await.expect("failed to build AppleTalk stack");
 
