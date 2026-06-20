@@ -5421,8 +5421,9 @@ dependencies = [
 
 [[package]]
 name = "stuffit"
-version = "0.1.5"
-source = "git+https://github.com/Arctessa/stuffit-rs?branch=huffman-method-3#68ab187af31cf608de3f2c86da3ec9bbaf7094c0"
+version = "0.1.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e78c1a26bb7200e58529fc19707c911a0bcddb92bbcb0e5803dfe11ad7fda0b8"
 dependencies = [
  "clap",
  "encoding_rs",
