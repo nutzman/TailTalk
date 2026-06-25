@@ -1,28 +1,86 @@
-use clap::Parser;
+use clap::{Parser, Subcommand, ValueEnum};
 use tailtalk::{
     TalkStack,
     atp::AtpAddress,
 };
 use tailtalk_packets::nbp::EntityName;
+use tokio::time::Duration;
+
+#[derive(ValueEnum, Debug, Clone, Copy)]
+enum PaperSize {
+    Letter,
+    A4,
+    Legal,
+    Executive,
+    B5,
+}
+
+impl PaperSize {
+    fn points(self) -> (u32, u32) {
+        match self {
+            PaperSize::Letter    => (612, 792),
+            PaperSize::A4        => (595, 842),
+            PaperSize::Legal     => (612, 1008),
+            PaperSize::Executive => (522, 756),
+            PaperSize::B5        => (516, 729),
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            PaperSize::Letter    => "Letter",
+            PaperSize::A4        => "A4",
+            PaperSize::Legal     => "Legal",
+            PaperSize::Executive => "Executive",
+            PaperSize::B5        => "B5",
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
-#[command(about = "Print a PostScript file to a PAP-capable AppleTalk printer")]
+#[command(about = "Print and query PAP-capable AppleTalk printers")]
 struct Args {
-    /// Network interface to bind to
-    #[arg(short, long)]
+    /// Network interface to bind to (EtherTalk)
+    #[arg(short, long, global = true)]
     interface: Option<String>,
 
     /// TashTalk serial port path (LocalTalk)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     tashtalk: Option<String>,
 
     /// Printer entity name to look up, e.g. "LaserWriter 4/600:LaserWriter@*"
-    #[arg(short, long, default_value = "=:LaserWriter@*")]
+    #[arg(short, long, global = true, default_value = "=:LaserWriter@*")]
     printer: String,
 
-    /// File to print (omit for a built-in test page)
-    #[arg(short, long)]
-    file: Option<String>,
+    /// Write a LocalTalk pcap capture to this file
+    #[arg(long, global = true)]
+    pcap: Option<String>,
+
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Print a PostScript file (omit --file for a built-in test page)
+    Print {
+        /// PostScript file to send
+        #[arg(short, long)]
+        file: Option<String>,
+    },
+    /// Query the printer's PAP status string
+    Status,
+    /// Query printer settings via the PostScript Query Protocol (PQP)
+    Query,
+    /// Dump the entire statusdict (all keys and values) for diagnostics
+    DumpStatusdict,
+    /// Connect to the printer and immediately close the connection (for diagnostics)
+    TestClose,
+    /// Permanently set the default paper size for the cassette tray (writes to NVRAM)
+    SetPaper {
+        /// Paper size to set
+        #[arg(value_enum)]
+        size: PaperSize,
+    },
 }
 
 #[tokio::main]
@@ -48,17 +106,21 @@ async fn main() -> anyhow::Result<()> {
     if let Some(ref tty) = args.tashtalk {
         builder = builder.localtalk(tty);
     }
-    let stack = builder.build().await.expect("failed to build AppleTalk stack");
+    if let Some(ref path) = args.pcap {
+        builder = builder.pcap_capture(path);
+    }
+    let stack = builder
+        .build()
+        .await
+        .expect("failed to build AppleTalk stack");
 
-    // Locate the printer via NBP
-    println!("Looking up printer '{}'...", entity);
     let tuples = stack.nbp.lookup(entity).await?;
     let printer = tuples
         .first()
         .ok_or_else(|| anyhow::anyhow!("Printer not found on network"))?;
 
     println!(
-        "Found printer {} at {}.{} socket {}",
+        "Found {} at {}.{} socket {}",
         printer.entity_name, printer.network_number, printer.node_id, printer.socket_number
     );
 
@@ -68,21 +130,91 @@ async fn main() -> anyhow::Result<()> {
         socket_number: printer.socket_number,
     };
 
-    // Query status
-    println!("Querying printer status...");
-    match stack.pap_status(printer_addr).await {
-        Ok(status) => println!("Printer status: '{}'", status),
-        Err(e) => println!("Could not get status: {}", e),
-    }
+    let is_laserwriter = printer.entity_name.object.contains("LaserWriter");
 
-    // Prepare data
-    let data = if let Some(path) = &args.file {
-        println!("Reading file '{}'...", path);
-        std::fs::read(path)?
-    } else if printer.entity_name.object.contains("LaserWriter") {
-        println!("Using built-in test page...");
+    match args.command {
+        Command::Status => {
+            let status = stack.pap_status(printer_addr).await?;
+            println!("{}", status);
+        }
 
-        b"%!PS-Adobe-2.0
+        Command::Query => {
+            let labels = &[
+                "Product", "PS Version", "Firmware Rev", "Resolution",
+                "RAM (bytes)", "Page count", "Page size (pts)", "AppleTalk type",
+                "Input trays", "Tray 0 paper (pts)", "Has manual feed",
+            ];
+
+            // All queries in one job. `stopped` isolates failures per entry; `printval`
+            // handles arrays (e.g. PageSize). Procedure entries need `begin/end` to call them.
+            let job =
+                "%!PS-Adobe-3.0\n\
+                 %%EndComments\n\
+                 errordict /handleerror {} put\n\
+                 /printval {\n\
+                   dup type /arraytype eq {\n\
+                     { dup type /stringtype eq { print } { 20 string cvs print } ifelse ( ) print } forall\n\
+                     (\\n) print\n\
+                   } { = } ifelse\n\
+                 } def\n\
+                 { statusdict /product get printval } stopped { (error) = } if\n\
+                 { version printval } stopped { (error) = } if\n\
+                 { statusdict /revision get printval } stopped { (error) = } if\n\
+                 { statusdict /resolution get printval } stopped { currentpagedevice /HWResolution get 0 get printval } if\n\
+                 { statusdict begin ramsize end printval } stopped { (error) = } if\n\
+                 { statusdict begin pagecount end printval } stopped { (error) = } if\n\
+                 { currentpagedevice /PageSize get printval } stopped { (error) = } if\n\
+                 { statusdict /appletalktype get printval } stopped { (error) = } if\n\
+                 { currentpagedevice /InputAttributes get length = } stopped { (error) = } if\n\
+                 { currentpagedevice /InputAttributes get 0 get /PageSize get printval } stopped { (error) = } if\n\
+                 { currentpagedevice /ManualFeed known = } stopped { (error) = } if\n\
+                 flush\n\
+                 %%EOF\n";
+
+            let mut client = stack.pap_client().await;
+            client.connect(printer_addr).await?;
+            client.print_stream(std::io::Cursor::new(job.as_bytes())).await?;
+
+            let response_bytes = tokio::time::timeout(
+                Duration::from_secs(15),
+                client.read_response(),
+            ).await.unwrap_or_else(|_| Ok(vec![]))?;
+
+            client.close().await?;
+
+            let response = String::from_utf8_lossy(&response_bytes);
+            // Filter PS status messages (%%[ ... ]%%) that shift line offsets.
+            let mut lines = response.lines().filter(|l| !l.trim_start().starts_with("%%["));
+            for label in labels {
+                let value = lines.next().unwrap_or("no response");
+                println!("{label}: {}", if value.is_empty() { "no response" } else { value });
+            }
+        }
+
+
+        Command::Print { file } => {
+            println!("Querying status...");
+            match stack.pap_status(printer_addr).await {
+                Ok(status) => println!("Status: {}", status),
+                Err(e) => println!("Could not get status: {}", e),
+            }
+
+            let mut client = stack.pap_client().await;
+            client.connect(printer_addr).await?;
+
+            if let Some(path) = file {
+                println!("Sending '{}'...", path);
+                let f = tokio::fs::File::open(&path).await?;
+                client.print_stream(f).await?;
+            
+            } else if ! is_laserwriter {
+                // Simple text only page
+                println!("Sending built-in test page...");
+                let data: &[u8] = b"Hello, non-laserwriter printer!";
+                client.print_stream(std::io::Cursor::new(data)).await?;
+            } else {
+                println!("Sending built-in test page...");
+                let data: &[u8] = b"%!PS-Adobe-2.0
 %%Title: TailTalk Test Page
 %%Creator: TailTalk pap-print
 %%EndComments
@@ -90,23 +222,92 @@ async fn main() -> anyhow::Result<()> {
 72 720 moveto
 (TailTalk PAP Test) show
 showpage
-"
-        .to_vec()
-    } else {
-        println!("Generating test page...");
-                b"Hello, ImageWriter!
-"
-                .to_vec()
-    };
+";
+                client.print_stream(std::io::Cursor::new(data)).await?;
+            }
 
-    println!("Connecting to printer ({} bytes to send)...", data.len());
-    let mut client = stack.pap_client().await;
-    client.connect(printer_addr).await?;
+            println!("Done.");
+        }
 
-    println!("Printing...");
-    client.print(&data).await?;
+        Command::DumpStatusdict => {
+            if is_laserwriter {
+                let job =
+                    "%!PS-Adobe-3.0\n\
+                    %%EndComments\n\
+                    errordict /handleerror {} put\n\
+                    statusdict { exch = = } forall\n\
+                    flush\n\
+                    %%EOF\n";
 
-    println!("Print job finished successfully!");
+                let mut client = stack.pap_client().await;
+                client.connect(printer_addr).await?;
+                client.print_stream(std::io::Cursor::new(job.as_bytes())).await?;
+
+                let response_bytes = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    client.read_response(),
+                ).await.unwrap_or_else(|_| Ok(vec![]))?;
+
+                client.close().await?;
+
+                print!("{}", String::from_utf8_lossy(&response_bytes));
+            } else {
+                println!("Cannot get status on text printer");
+            }
+        }
+        
+
+        Command::SetPaper { size } => {
+            if is_laserwriter {
+                let (w, h) = size.points();
+                println!("Setting default paper size to {} ({}×{} pts)...", size.label(), w, h);
+
+                // Per developer note p.13: must set both /PageSize and /InputAttributes slot 0.
+                // exitserver (password 0) makes setpagedevice write to NVRAM.
+                let job = format!(
+                    "%!PS-Adobe-3.0\n\
+                    %%EndComments\n\
+                    serverdict begin 0 exitserver\n\
+                    << /PageSize [{w} {h}] /InputAttributes << 0 << /PageSize [{w} {h}] >> >> >> setpagedevice\n\
+                    flush\n\
+                    %%EOF\n"
+                );
+
+                let mut client = stack.pap_client().await;
+                client.connect(printer_addr).await?;
+                client.print_stream(std::io::Cursor::new(job.as_bytes())).await?;
+
+                let response_bytes = tokio::time::timeout(
+                    Duration::from_secs(15),
+                    client.read_response(),
+                ).await.unwrap_or_else(|_| Ok(vec![]))?;
+
+                client.close().await?;
+
+                let response = String::from_utf8_lossy(&response_bytes);
+                let output: Vec<&str> = response.lines()
+                    .filter(|l| !l.trim_start().starts_with("%%["))
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                if output.is_empty() {
+                    println!("Done.");
+                } else {
+                    println!("Printer responded:\n{}", output.join("\n"));
+                }
+            } else {
+                println!("Cannot set paper size on text printer.");
+            }
+        }
+
+        Command::TestClose => {
+            println!("Connecting...");
+            let mut client = stack.pap_client().await;
+            client.connect(printer_addr).await?;
+            println!("Connected. Sending CloseConn...");
+            client.close().await?;
+            println!("CloseConn acknowledged.");
+        }
+    }
 
     Ok(())
 }

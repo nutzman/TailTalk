@@ -23,6 +23,8 @@ pub struct PendingRequestState {
     pub eom_seq: Option<u8>,
     pub raw_packet: Vec<u8>,
     pub destination: AtpAddress,
+    /// Number of retransmissions sent so far (not counting the initial send).
+    pub retry_count: u8,
 }
 
 type AtpTransactionMap = HashMap<u16, PendingRequestState>;
@@ -140,15 +142,38 @@ impl AtpReceivedRequest {
             })
             .collect();
 
-        // Always send at least one packet (e.g. empty ASP OpenSession replies)
+        // ATP requires at least one TResp even for zero-length data.
         if packets.is_empty() {
-            packets.push(AtpResponse {
-                data: vec![],
-                user_bytes,
-            });
+            packets.push(AtpResponse { data: vec![], user_bytes });
         }
 
-        // Send via internal method
+        self.send_response_internal(packets).await
+    }
+
+    /// Send a response fragmented at `chunk_size` bytes per ATP packet.
+    ///
+    /// Use this when the protocol layer imposes a stricter per-packet limit than
+    /// `ATP_MAX_DATA_PER_PACKET`. PAP, for example, caps each packet at 512 bytes.
+    pub async fn send_response_chunked(
+        &self,
+        data: Vec<u8>,
+        user_bytes: [u8; 4],
+        chunk_size: usize,
+    ) -> Result<(), io::Error> {
+        assert!(chunk_size > 0, "chunk_size must be positive");
+        let effective_bitmap = if self.bitmap == 0x00 { 0xFF } else { self.bitmap };
+        let max_packets = (effective_bitmap.count_ones() as usize).clamp(1, 8);
+        let max_data = max_packets * chunk_size;
+
+        let mut packets: Vec<AtpResponse> = data[..data.len().min(max_data)]
+            .chunks(chunk_size)
+            .map(|chunk| AtpResponse { data: chunk.to_vec(), user_bytes })
+            .collect();
+
+        if packets.is_empty() {
+            packets.push(AtpResponse { data: vec![], user_bytes });
+        }
+
         self.send_response_internal(packets).await
     }
 
@@ -322,12 +347,32 @@ impl Atp {
             return;
         }
 
-        let retransmits: Vec<(u16, Vec<u8>, AtpAddress)> = self.pending_transactions
-            .iter()
-            .map(|(tid, state)| (*tid, state.raw_packet.clone(), state.destination))
-            .collect();
+        // ATP spec: give up after 8 retransmits (9 total attempts).
+        const MAX_RETRIES: u8 = 8;
 
-        for (tid, packet, dest_addr) in retransmits {
+        let mut to_evict: Vec<u16> = Vec::new();
+        let mut to_resend: Vec<(u16, Vec<u8>, AtpAddress)> = Vec::new();
+
+        for (tid, state) in &mut self.pending_transactions {
+            state.retry_count += 1;
+            if state.retry_count > MAX_RETRIES {
+                to_evict.push(*tid);
+            } else {
+                to_resend.push((*tid, state.raw_packet.clone(), state.destination));
+            }
+        }
+
+        for tid in to_evict {
+            if let Some(state) = self.pending_transactions.remove(&tid) {
+                tracing::warn!("ATP: TID {} got no response after {} retransmits, giving up", tid, MAX_RETRIES);
+                let _ = state.chan.send(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "ATP: no response after maximum retransmits",
+                )));
+            }
+        }
+
+        for (tid, packet, dest_addr) in to_resend {
             let dest = crate::ddp::DdpAddress::new(
                 tailtalk_packets::aarp::AppleTalkAddress {
                     network_number: dest_addr.network_number,
@@ -344,8 +389,25 @@ impl Atp {
     }
 
     async fn handle_send_request(&mut self, req: AtpSendRequest) {
-        let tid = self.next_tid;
-        self.next_tid = self.next_tid.wrapping_add(1);
+        // Skip any TID that is still in pending_transactions to prevent aliasing a live
+        // transaction on wrapping. A freed TID is naturally eligible for reuse.
+        let tid = {
+            let start = self.next_tid;
+            loop {
+                let candidate = self.next_tid;
+                self.next_tid = self.next_tid.wrapping_add(1);
+                if !self.pending_transactions.contains_key(&candidate) {
+                    break candidate;
+                }
+                if self.next_tid == start {
+                    let _ = req.chan.send(Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "ATP: all transaction IDs in use",
+                    )));
+                    return;
+                }
+            }
+        };
 
         let packet = AtpPacket {
             function: AtpFunction::Request,
@@ -403,6 +465,7 @@ impl Atp {
                     eom_seq: None,
                     raw_packet,
                     destination: req.address,
+                    retry_count: 0,
                 },
             );
         }

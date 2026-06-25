@@ -6,6 +6,7 @@ use tailtalk::{
     addressing::Addressing,
     atp::Atp,
     ddp::DdpProcessor,
+    route_table::{LearningMode, RouteTable},
     echo::Echo,
     nbp::{Nbp, RegisteredName},
     pap::PapClient,
@@ -81,13 +82,13 @@ impl TestClient {
         });
 
         let addressing = Addressing::spawn(Some(mac), outbound_handle.clone(), None, AddressSource::EtherTalkPhase2);
-        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone());
+        let ddp = DdpProcessor::spawn(Some(addressing.clone()), None, outbound_handle.clone(), RouteTable::new(LearningMode::Static));
 
         let echo = Echo::spawn(&ddp).await;
         // spawn returns (socket, req, resp)
         let (_sock, atp_req, atp_resp) = Atp::spawn(&ddp, atp_socket).await;
 
-        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None).await;
+        let nbp = Nbp::spawn(&ddp, Some(addressing.clone()), None, RouteTable::new(LearningMode::Static)).await;
 
         let mut rx = hub_rx;
         let ddp_handle = ddp.clone();
@@ -237,6 +238,7 @@ async fn test_pap_print_job() {
             connection_id: conn_id,
             function: PapFunction::OpenConnReply,
             sequence_num: 0,
+            eof: false,
             data: vec![130, 8, 0, 0], // Socket=130, Flow=8, Result=0
         };
         let (ub, d) = reply.to_atp_parts();
@@ -272,6 +274,7 @@ async fn test_pap_print_job() {
         connection_id: conn_id,
         function: PapFunction::SendData,
         sequence_num: 1,
+        eof: false,
         data: vec![],
     };
     let (ub, d) = send_data_pkt.to_atp_parts();

@@ -1,4 +1,3 @@
-use byteorder::{BigEndian, ByteOrder};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -45,16 +44,20 @@ impl TryFrom<u8> for PapFunction {
 
 /// PAP packet structure
 ///
-/// PAP packets are sent over ATP and have the following format:
+/// PAP packets are sent over ATP. For Data/SendData the ATP user bytes are:
 /// - Byte 0: Connection ID
 /// - Byte 1: Function code
-/// - Bytes 2-3: Sequence number (for some functions)
-/// - Remaining bytes: Function-specific data
+/// - Byte 2: EOF flag (Data only; 0 = more data, non-zero = end of job)
+/// - Byte 3: Sequence number (Data and SendData; wraps mod 256)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PapPacket {
     pub connection_id: u8,
     pub function: PapFunction,
+    /// Sequence number. Meaningful only for `SendData` (ATP user bytes 2-3, big-endian).
+    /// Ignored on serialization for all other functions; always decoded as 0.
     pub sequence_num: u16,
+    /// End-of-file flag; only meaningful for `Data` packets.
+    pub eof: bool,
     pub data: Vec<u8>,
 }
 
@@ -74,8 +77,8 @@ impl PapPacket {
         let connection_id = buf[0];
         let function = PapFunction::try_from(buf[1])?;
 
-        // Some functions include a sequence number, others don't
-        let (sequence_num, data_start) = match function {
+        // Data and SendData carry a sequence number in byte 3; Data also has an EOF flag in byte 2.
+        let (sequence_num, eof, data_start) = match function {
             PapFunction::SendData | PapFunction::Data => {
                 if buf.len() < 4 {
                     return Err(PapError::InvalidSize {
@@ -83,9 +86,10 @@ impl PapPacket {
                         found: buf.len(),
                     });
                 }
-                (BigEndian::read_u16(&buf[2..4]), 4)
+                let eof = function == PapFunction::Data && buf[2] != 0;
+                (buf[3] as u16, eof, 4)
             }
-            _ => (0, 2),
+            _ => (0, false, 2),
         };
 
         let data = buf[data_start..].to_vec();
@@ -94,6 +98,7 @@ impl PapPacket {
             connection_id,
             function,
             sequence_num,
+            eof,
             data,
         })
     }
@@ -116,7 +121,9 @@ impl PapPacket {
         buf[1] = self.function as u8;
 
         if has_seq_num {
-            BigEndian::write_u16(&mut buf[2..4], self.sequence_num);
+            // Byte 2: EOF flag (Data only), byte 3: sequence number (mod 256).
+            buf[2] = if self.function == PapFunction::Data { self.eof as u8 } else { 0 };
+            buf[3] = self.sequence_num as u8;
             buf[4..total_len].copy_from_slice(&self.data);
         } else {
             buf[2..total_len].copy_from_slice(&self.data);
@@ -150,10 +157,18 @@ impl PapPacket {
         user_bytes[0] = self.connection_id;
         user_bytes[1] = self.function as u8;
 
-        if matches!(self.function, PapFunction::SendData | PapFunction::Data) {
-            BigEndian::write_u16(&mut user_bytes[2..4], self.sequence_num);
+        match self.function {
+            PapFunction::Data => {
+                // Byte 2: EOF flag, byte 3: sequence number (mod 256).
+                user_bytes[2] = self.eof as u8;
+                user_bytes[3] = self.sequence_num as u8;
+            }
+            PapFunction::SendData => {
+                // Byte 2: reserved (0), byte 3: sequence number (mod 256).
+                user_bytes[3] = self.sequence_num as u8;
+            }
+            _ => {}
         }
-        // All other PAP functions: bytes 2-3 in user_bytes remain zero
 
         (user_bytes, &self.data)
     }
@@ -163,15 +178,17 @@ impl PapPacket {
         let connection_id = user_bytes[0];
         let function = PapFunction::try_from(user_bytes[1])?;
 
-        let sequence_num = match function {
-            PapFunction::SendData | PapFunction::Data => BigEndian::read_u16(&user_bytes[2..4]),
-            _ => 0,
+        let (sequence_num, eof) = match function {
+            PapFunction::Data => (user_bytes[3] as u16, user_bytes[2] != 0),
+            PapFunction::SendData => (user_bytes[3] as u16, false),
+            _ => (0, false),
         };
 
         Ok(Self {
             connection_id,
             function,
             sequence_num,
+            eof,
             data: data.to_vec(),
         })
     }
@@ -212,7 +229,8 @@ mod tests {
         let packet = PapPacket {
             connection_id: 7,
             function: PapFunction::OpenConnReply,
-            sequence_num: 0,                          // Not used for OpenConnReply
+            sequence_num: 0,
+            eof: false,
             data: vec![0x42, 0x00, 0x08, 0x00, 0x01], // socket, flow_quantum, result
         };
 
@@ -229,6 +247,7 @@ mod tests {
             connection_id: 3,
             function: PapFunction::Data,
             sequence_num: 42,
+            eof: false,
             data: b"PostScript data".to_vec(),
         };
 
@@ -238,7 +257,8 @@ mod tests {
         assert_eq!(len, 4 + 15); // 4 byte header + 15 bytes data
         assert_eq!(buf[0], 3); // connection_id
         assert_eq!(buf[1], 4); // function code for Data
-        assert_eq!(BigEndian::read_u16(&buf[2..4]), 42); // sequence_num
+        assert_eq!(buf[2], 0); // EOF flag (false)
+        assert_eq!(buf[3], 42); // sequence_num
         assert_eq!(&buf[4..len], b"PostScript data");
     }
 
@@ -248,6 +268,7 @@ mod tests {
             connection_id: 10,
             function: PapFunction::Tickle,
             sequence_num: 0,
+            eof: false,
             data: vec![],
         };
 
@@ -265,6 +286,7 @@ mod tests {
             connection_id: 15,
             function: PapFunction::SendData,
             sequence_num: 100,
+            eof: false,
             data: b"Test print job data".to_vec(),
         };
 
@@ -293,6 +315,7 @@ mod tests {
             connection_id: 1,
             function: PapFunction::Status,
             sequence_num: 0,
+            eof: false,
             data: vec![1, 2, 3, 4, 5],
         };
 
@@ -306,14 +329,16 @@ mod tests {
         let original = PapPacket {
             connection_id: 10,
             function: PapFunction::SendData,
-            sequence_num: 12345,
+            sequence_num: 57,
+            eof: false,
             data: b"Data Payload".to_vec(),
         };
 
         let (user_bytes, data) = original.to_atp_parts();
         assert_eq!(user_bytes[0], 10);
         assert_eq!(user_bytes[1], 3); // SendData
-        assert_eq!(BigEndian::read_u16(&user_bytes[2..4]), 12345);
+        assert_eq!(user_bytes[2], 0); // reserved
+        assert_eq!(user_bytes[3], 57); // sequence_num
         assert_eq!(data, b"Data Payload");
 
         let parsed = PapPacket::parse_from_atp(user_bytes, data).expect("failed to parse from atp");
