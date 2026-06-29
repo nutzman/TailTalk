@@ -7,8 +7,6 @@ pub enum DdpError {
     InvalidSize { expected: usize, found: usize },
     #[error("unknown header type - expected 1 or 2, but found {header:?}")]
     UnknownHeader { header: u8 },
-    #[error("unknown protocol type {found:?}")]
-    UnknownProtocol { found: u8 },
 }
 
 const RTMP_RESPONSE: u8 = 1;
@@ -29,21 +27,35 @@ pub enum DdpProtocolType {
     RtmpRequest = RTMP_REQUEST,
     Zip = ZIP,
     Adsp = ADSP,
+    Other(u8),
 }
 
-impl TryFrom<u8> for DdpProtocolType {
-    type Error = DdpError;
-
-    fn try_from(data: u8) -> Result<Self, Self::Error> {
+impl From<u8> for DdpProtocolType {
+    fn from(data: u8) -> Self {
         match data {
-            RTMP_RESPONSE => Ok(DdpProtocolType::RtmpResponse),
-            NBP => Ok(DdpProtocolType::Nbp),
-            ATP => Ok(DdpProtocolType::Atp),
-            AEP => Ok(DdpProtocolType::Aep),
-            RTMP_REQUEST => Ok(DdpProtocolType::RtmpRequest),
-            ZIP => Ok(DdpProtocolType::Zip),
-            ADSP => Ok(DdpProtocolType::Adsp),
-            _ => Err(DdpError::UnknownProtocol { found: data }),
+            RTMP_RESPONSE => DdpProtocolType::RtmpResponse,
+            NBP => DdpProtocolType::Nbp,
+            ATP => DdpProtocolType::Atp,
+            AEP => DdpProtocolType::Aep,
+            RTMP_REQUEST => DdpProtocolType::RtmpRequest,
+            ZIP => DdpProtocolType::Zip,
+            ADSP => DdpProtocolType::Adsp,
+            _ => DdpProtocolType::Other(data),
+        }
+    }
+}
+
+impl From<DdpProtocolType> for u8 {
+    fn from(protocol: DdpProtocolType) -> Self {
+        match protocol {
+            DdpProtocolType::RtmpResponse => RTMP_RESPONSE,
+            DdpProtocolType::Nbp => NBP,
+            DdpProtocolType::Atp => ATP,
+            DdpProtocolType::Aep => AEP,
+            DdpProtocolType::RtmpRequest => RTMP_REQUEST,
+            DdpProtocolType::Zip => ZIP,
+            DdpProtocolType::Adsp => ADSP,
+            DdpProtocolType::Other(v) => v,
         }
     }
 }
@@ -96,7 +108,7 @@ impl DdpPacket {
         let src_node_id = bytes[9];
         let dest_sock_num = bytes[10];
         let src_sock_num = bytes[11];
-        let protocol_typ = bytes[12].try_into()?;
+        let protocol_typ = bytes[12].into();
 
         Ok(Self {
             dest_node_id,
@@ -123,7 +135,7 @@ impl DdpPacket {
         let len = (BigEndian::read_u16(bytes) & 0x3FF) as usize;
         let dest_sock_num = bytes[2];
         let src_sock_num = bytes[3];
-        let protocol_typ = bytes[4].try_into()?;
+        let protocol_typ = bytes[4].into();
 
         Ok(Self {
             dest_node_id: dst_node,
@@ -156,7 +168,7 @@ impl DdpPacket {
         buf[9] = self.src_node_id;
         buf[10] = self.dest_sock_num;
         buf[11] = self.src_sock_num;
-        buf[12] = self.protocol_typ as u8;
+        buf[12] = u8::from(self.protocol_typ);
 
         Ok(13)
     }
@@ -172,7 +184,7 @@ impl DdpPacket {
         BigEndian::write_u16(buf, self.len as u16 & 0x3FF);
         buf[2] = self.dest_sock_num;
         buf[3] = self.src_sock_num;
-        buf[4] = self.protocol_typ as u8;
+        buf[4] = u8::from(self.protocol_typ);
 
         Ok(5)
     }
