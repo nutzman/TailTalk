@@ -102,6 +102,10 @@ struct BridgeState {
     jobs: RwLock<HashMap<u32, Arc<Mutex<JobRecord>>>>,
     next_job_id: AtomicU32,
     start_time: Instant,
+    /// Per-printer locks (keyed by printer key) serialising PAP sessions:
+    /// LaserWriters accept one PAP connection at a time and connect() gives
+    /// up after 60s of busy-retries, so concurrent jobs must queue here.
+    pap_locks: std::sync::Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
@@ -129,6 +133,7 @@ pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
         jobs: RwLock::new(HashMap::new()),
         next_job_id: AtomicU32::new(1),
         start_time: Instant::now(),
+        pap_locks: std::sync::Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -172,6 +177,10 @@ pub async fn run(nbp: NbpHandle, ddp: DdpHandle, token: CancellationToken) {
             drop(rx);
         }
     }
+    drop(lock);
+    // Stop the mdns-sd background thread; dropping the handle alone leaks it,
+    // and the bridge is respawned with a fresh daemon on every server start.
+    let _ = mdns.shutdown();
 }
 
 /// Non-loopback IPv4 addresses; avoids 127.0.0.1 appearing in mDNS advertisements.
@@ -198,6 +207,7 @@ fn make_key(name: &str) -> String {
         .to_string()
 }
 
+#[allow(dead_code)]
 fn urf_string(caps: &PrinterCaps) -> String {
     // CP1 = sRGB profile 1 (required by AirPrint spec; CP255 is not valid).
     // We always advertise SRGB24 so iOS sends colour jobs; ghostscript converts to mono.
@@ -227,21 +237,26 @@ async fn discover(
         .filter(|k| !k.is_empty())
         .collect();
 
-    let mut current = printers.write().await;
-
-    current.retain(|p| {
-        if new_keys.contains(&p.key) {
-            true
-        } else {
-            if let Ok(rx) = mdns.unregister(&p.mdns_fullname) { drop(rx); }
-            false
-        }
-    });
+    // Prune vanished printers under a short-lived write lock, then release it:
+    // query_printer_caps can block for over a minute on a busy/unreachable
+    // printer, and every IPP handler takes printers.read() first.
+    let mut current_keys: HashSet<String> = {
+        let mut current = printers.write().await;
+        current.retain(|p| {
+            if new_keys.contains(&p.key) {
+                true
+            } else {
+                if let Ok(rx) = mdns.unregister(&p.mdns_fullname) { drop(rx); }
+                false
+            }
+        });
+        current.iter().map(|p| p.key.clone()).collect()
+    };
 
     for tuple in &tuples {
         let name = tuple.entity_name.object.clone();
         let key = make_key(&name);
-        if key.is_empty() || current.iter().any(|p| p.key == key) {
+        if key.is_empty() || current_keys.contains(&key) {
             continue;
         }
 
@@ -293,7 +308,8 @@ async fn discover(
             "IPP bridge: registered '{name}' → /ipp/{key} ({}dpi, color={}, default={})",
             caps.dpi, caps.color, caps.media_default,
         );
-        current.push(Printer { name, addr, key, mdns_fullname, caps });
+        current_keys.insert(key.clone());
+        printers.write().await.push(Printer { name, addr, key, mdns_fullname, caps });
     }
 
 }
@@ -516,16 +532,14 @@ fn extract_job_id(parsed: &IppRequestResponse) -> Option<u32> {
         .groups_of(DelimiterTag::OperationAttributes)
         .next()
         .and_then(|g| {
-            if let Some(a) = g.attributes().get("job-id") {
-                if let IppValue::Integer(id) = a.value() {
+            if let Some(a) = g.attributes().get("job-id")
+                && let IppValue::Integer(id) = a.value() {
                     return Some(*id as u32);
                 }
-            }
-            if let Some(a) = g.attributes().get("job-uri") {
-                if let IppValue::Uri(u) = a.value() {
+            if let Some(a) = g.attributes().get("job-uri")
+                && let IppValue::Uri(u) = a.value() {
                     return u.as_str().rsplit('/').next()?.parse::<u32>().ok();
                 }
-            }
             None
         })
 }
@@ -601,6 +615,10 @@ async fn handle_ipp(
             let ddp = state.ddp.clone();
             let addr = printer.addr;
             let dpi = printer.caps.dpi;
+            let pap_lock = {
+                let mut locks = state.pap_locks.lock().unwrap();
+                locks.entry(printer.key.clone()).or_default().clone()
+            };
             tokio::spawn(async move {
                 job.lock().await.state_message = "Rasterizing".to_string();
                 let (ps, page_count) = match rasterize_to_ps(doc, &fmt, &tray, dpi, job_id).await {
@@ -614,6 +632,8 @@ async fn handle_ipp(
                     }
                 };
                 tracing::info!("IPP: rasterized {page_count} page(s) to {} bytes PS", ps.len());
+                job.lock().await.state_message = "Waiting for printer".to_string();
+                let _pap_guard = pap_lock.lock().await;
                 job.lock().await.state_message = "Printing".to_string();
                 match print_to_pap(ddp, addr, ps).await {
                     Ok(printer_output) => {
@@ -772,7 +792,7 @@ fn printer_attributes(printer: &Printer, req_id: u32) -> axum::response::Respons
         IppValue::Enum(Operation::GetPrinterAttributes as i32),
     ]));
     if let Ok(c) = "utf-8".try_into() { add("charset-configured", IppValue::Charset(c)); }
-    if let Ok(c) = "utf_8".try_into() { add("charset-supported", IppValue::Charset(c)); }
+    if let Ok(c) = "utf-8".try_into() { add("charset-supported", IppValue::Charset(c)); }
     if let Ok(l) = "en".try_into() { add("natural-language-configured", IppValue::NaturalLanguage(l)); }
     if let Ok(l) = "en".try_into() { add("generated-natural-language-supported", IppValue::NaturalLanguage(l)); }
     if let Ok(m) = "application/pdf".try_into() {
@@ -914,7 +934,7 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     tokio::fs::write(&urf_path, &data).await?;
 
     #[cfg(target_os = "macos")]
-    let result: anyhow::Result<Vec<u8>> = {
+    return {
         let pdf_path = tmp.join(format!("tailtalk-{job_token}.pdf"));
         let status = tokio::process::Command::new("sips")
             .args(["--setProperty", "format", "pdf"])
@@ -933,7 +953,7 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     };
 
     #[cfg(target_os = "linux")]
-    let result: anyhow::Result<Vec<u8>> = {
+    return {
         // ippeveps converts URF → PostScript; gs accepts PS from a file just as well as PDF.
         let output = tokio::process::Command::new("ippeveps")
             .arg(&urf_path)
@@ -951,12 +971,10 @@ async fn urf_to_rasterizable(data: Vec<u8>, job_token: u32) -> anyhow::Result<Ve
     // should never reach here because URF is not advertised in the mDNS record on Windows,
     // but guard against it explicitly.
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    let result: anyhow::Result<Vec<u8>> = {
+    {
         let _ = tokio::fs::remove_file(&urf_path).await;
         anyhow::bail!("URF format is not supported on this platform");
-    };
-
-    result
+    }
 }
 
 /// Return the name of the Ghostscript executable on this platform.
@@ -1085,7 +1103,7 @@ fn parse_pbm_pages(data: &[u8]) -> anyhow::Result<Vec<(u32, u32, Vec<u8>)>> {
     let mut pos = 0;
     while pos < data.len() {
         let Some((w, h, header_len)) = parse_pbm_header(&data[pos..]) else { break };
-        let row_bytes = (w as usize + 7) / 8;
+        let row_bytes = (w as usize).div_ceil(8);
         let page_bytes = row_bytes * h as usize;
         let data_start = pos + header_len;
         let data_end = data_start + page_bytes;

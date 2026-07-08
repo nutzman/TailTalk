@@ -18,6 +18,26 @@ use tailtalk_packets::afp::{
 use tailtalk_packets::nbp::EntityName;
 use tracing::{debug, error, info, warn};
 
+/// Volume ID advertised to clients and echoed back on per-volume commands.
+/// A single volume is served, so any stable non-zero value works.
+const AFP_VOLUME_ID: u16 = 1234;
+
+/// Parse a client-supplied AFP request at byte offset `$off`, or reply with
+/// the parse error and return. Uses `.get()` instead of slicing so a
+/// truncated packet is rejected by `parse` rather than panicking.
+macro_rules! parse_or_reply {
+    ($command:expr, $ty:ty, $off:expr) => {
+        match <$ty>::parse($command.data.get($off..).unwrap_or(&[])) {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("AFP {} parse error: {:?}", stringify!($ty), e);
+                $command.send_reply(create_error_reply(e))?;
+                return Ok(());
+            }
+        }
+    };
+}
+
 /// AFP Server configuration
 pub struct AfpServerConfig {
     pub server_name: String,
@@ -33,8 +53,8 @@ pub struct AfpServerConfig {
 
 impl Default for AfpServerConfig {
     fn default() -> Self {
-        // Default volume icon (same as example)
-        let _volume_icon = [
+        // Default volume icon taken from Mac OS 9
+        let volume_icon = [
             0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1, 0x0, 0x0, 0x0, 0x2, 0x9f, 0xe0, 0x0,
             0x4, 0x50, 0x30, 0x0, 0x8, 0x30, 0x28, 0x0, 0x10, 0x10, 0x3c, 0x7, 0xa0, 0x8, 0x4,
             0x18, 0x7f, 0x4, 0x4, 0x10, 0x0, 0x82, 0x4, 0x10, 0x0, 0x81, 0x4, 0x10, 0x0, 0x82, 0x4,
@@ -59,7 +79,7 @@ impl Default for AfpServerConfig {
             machine_type: "Macintosh".to_string(),
             afp_versions: vec![AfpVersion::Version2, AfpVersion::Version2_1],
             uams: vec![AfpUam::NoUserAuthent],
-            volume_icon: None,
+            volume_icon: Some(volume_icon),
             flags: 0x3,
             volume_path: PathBuf::from("./"),
             volume_name: "MacShare".to_string(),
@@ -71,6 +91,8 @@ impl Default for AfpServerConfig {
 pub struct AfpServer {
     asp_handle: AspHandle,
     config: Arc<AfpServerConfig>,
+    db: sled::Db,
+    shutdown: CancellationToken,
 }
 
 impl AfpServer {
@@ -85,7 +107,7 @@ impl AfpServer {
         config: AfpServerConfig,
         shutdown: CancellationToken,
         services_done: CancellationToken,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<()> {
         let config = Arc::new(config);
 
         // Create server status information
@@ -114,60 +136,44 @@ impl AfpServer {
 
         info!("AFP server '{}' started", config.server_name);
 
-        let server = Self { asp_handle, config };
+        // Open the desktop DB before spawning so failures surface as errors to the caller.
+        // sled::Db is internally reference-counted so all clones share the same on-disk DB.
+        let db = crate::afp::DesktopDatabase::open_or_create(&config.volume_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open desktop database: {e:?}"))?;
 
-        // Spawn session handler
-        let server_clone_config = server.config.clone();
-        let server_clone_handle = server.asp_handle.clone();
-        tokio::spawn(async move {
-            run_server(server_clone_handle, server_clone_config, shutdown).await;
-        });
+        tokio::spawn(Self { asp_handle, config, db, shutdown }.run());
 
-        Ok(server)
+        Ok(())
     }
-}
 
-/// Run the AFP server session loop
-async fn run_server(asp_handle: AspHandle, config: Arc<AfpServerConfig>, token: CancellationToken) {
-    info!(
-        "AFP server '{}' waiting for sessions...",
-        config.server_name
-    );
+    async fn run(self) {
+        info!("AFP server '{}' waiting for sessions...", self.config.server_name);
 
-    // Open the desktop DB once and share the handle across all sessions via clone.
-    // sled::Db is internally reference-counted so all clones share the same on-disk DB.
-    let shared_db = match crate::afp::DesktopDatabase::open_or_create(&config.volume_path) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Failed to open desktop database: {:?}", e);
-            return;
+        let mut session_count = 0;
+
+        loop {
+            let session = tokio::select! {
+                _ = self.shutdown.cancelled() => break,
+                result = self.asp_handle.get_session() => match result {
+                    Ok(s) => s,
+                    Err(e) => { error!("Failed to accept AFP session: {}", e); break; }
+                },
+            };
+
+            session_count += 1;
+            info!(
+                "AFP session {} accepted from {:?}",
+                session_count, session.remote_addr
+            );
+
+            let session_config = self.config.clone();
+            let session_db = self.db.clone();
+            tokio::spawn(async move {
+                if let Err(e) = session.handle_session(session_config, session_db).await {
+                    error!("Session error: {}", e);
+                }
+            });
         }
-    };
-
-    let mut session_count = 0;
-
-    loop {
-        let session = tokio::select! {
-            _ = token.cancelled() => break,
-            result = asp_handle.get_session() => match result {
-                Ok(s) => s,
-                Err(e) => { error!("Failed to accept AFP session: {}", e); break; }
-            },
-        };
-
-        session_count += 1;
-        info!(
-            "AFP session {} accepted from {:?}",
-            session_count, session.remote_addr
-        );
-
-        let session_config = config.clone();
-        let session_db = shared_db.clone();
-        tokio::spawn(async move {
-            if let Err(e) = session.handle_session(session_config, session_db).await {
-                error!("Session error: {}", e);
-            }
-        });
     }
 }
 
@@ -181,7 +187,7 @@ impl AspSession {
         let mut our_volume = Volume::new(
             volume_name,
             config.volume_path.clone(),
-            1234, // TODO: How should these IDs be created?
+            AFP_VOLUME_ID,
             desktop_db.clone(),
         )
         .await;
@@ -238,7 +244,7 @@ impl AspSession {
                             .map(|v| v.name.to_string())
                             .collect::<Vec<_>>()
                     );
-                    let mut output_buf = [0u8; 128];
+                    let mut output_buf = [0u8; 512];
                     let offset = vol_response.to_bytes(&mut output_buf).map_err(|e| {
                         anyhow::anyhow!("Failed to serialize AFP GetSrvrParms: {:?}", e)
                     })?;
@@ -262,11 +268,15 @@ impl AspSession {
                     })?;
                 }
                 tailtalk_packets::afp::AFP_CMD_OPEN_VOL => {
+                    if command.data.len() < 4 {
+                        command.send_reply(create_error_reply(AfpError::ParamError))?;
+                        continue;
+                    }
                     let bitmap_req = FPVolumeBitmap::from(u16::from_be_bytes(
-                        command.data[2..=3].try_into().unwrap(),
+                        [command.data[2], command.data[3]],
                     ));
                     debug!("AFP FPOpenVol req: bitmap={:?}", bitmap_req);
-                    let mut output_buf = [0u8; 128];
+                    let mut output_buf = [0u8; 512];
                     let offset = our_volume
                         .get_bitmap_resp(bitmap_req, &mut output_buf)
                         .await
@@ -284,12 +294,19 @@ impl AspSession {
                     })?;
                 }
                 tailtalk_packets::afp::AFP_CMD_GET_VOL_PARMS => {
-                    let vol_parms_req = FPGetVolParms::parse(&command.data[2..]).unwrap();
+                    let vol_parms_req = match FPGetVolParms::parse(command.data.get(2..).unwrap_or(&[])) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            debug!("AFP FPGetVolParms parse error: {:?}", e);
+                            command.send_reply(create_error_reply(e))?;
+                            continue;
+                        }
+                    };
                     debug!(
                         "AFP FPGetVolParms req: vol_id={}, bitmap={:?}",
                         vol_parms_req.volume_id, vol_parms_req.bitmap
                     );
-                    let mut output_buf = [0u8; 128];
+                    let mut output_buf = [0u8; 512];
                     let offset = our_volume
                         .get_bitmap_resp(vol_parms_req.bitmap, &mut output_buf)
                         .await
@@ -459,7 +476,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let lock_req = FPByteRangeLock::parse(&command.data[1..]).unwrap();
+        let lock_req = parse_or_reply!(command, FPByteRangeLock, 1);
         debug!(
             "AFP FPByteRangeLock req: fork_id={}, flags={:?}, offset={}, length={}",
             lock_req.fork_id, lock_req.flags, lock_req.offset, lock_req.length
@@ -490,7 +507,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPCreateDir::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPCreateDir, 2);
         debug!(
             "AFP FPCreateDir req: dir_id={}, path={:?}",
             cmd.directory_id,
@@ -522,7 +539,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPCreateFile::parse(&command.data[1..]).unwrap();
+        let cmd = parse_or_reply!(command, FPCreateFile, 1);
         debug!(
             "AFP FPCreateFile req: flag={:?}, dir_id={}, path={:?}",
             cmd.create_flag,
@@ -623,7 +640,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let delete_req = FPDelete::parse(&command.data[2..]).unwrap();
+        let delete_req = parse_or_reply!(command, FPDelete, 2);
         debug!(
             "AFP FPDelete req: dir_id={}, path={:?}",
             delete_req.directory_id, delete_req.path
@@ -654,7 +671,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPGetFileParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPGetFileParms, 2);
         let file_bitmap = cmd.file_bitmap;
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
@@ -716,7 +733,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPGetDirParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPGetDirParms, 2);
         let dir_bitmap = cmd.dir_bitmap;
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
@@ -778,7 +795,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPSetFileParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPSetFileParms, 2);
         let file_bitmap = cmd.file_bitmap;
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
@@ -820,7 +837,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPGetFileDirParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPGetFileDirParms, 2);
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = cmd.dir_bitmap;
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
@@ -892,7 +909,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPSetFileDirParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPSetFileDirParms, 2);
         let file_bitmap = cmd.file_bitmap;
         let dir_bitmap = FPDirectoryBitmap::from(cmd.file_bitmap.bits());
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
@@ -1045,7 +1062,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let dir_cmd = FPSetDirParms::parse(&command.data[2..]).unwrap();
+        let dir_cmd = parse_or_reply!(command, FPSetDirParms, 2);
         let path_name_buf = afp_path_to_posix(dir_cmd.path.as_str());
         debug!(
             "AFP FPSetDirParms req: dir_id={}, path={:?}, bitmap={:?}",
@@ -1105,7 +1122,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let flush_cmd = FPFlush::parse(&command.data[2..]).unwrap();
+        let flush_cmd = parse_or_reply!(command, FPFlush, 2);
         debug!("AFP FPFlush req: vol_id={}", flush_cmd.volume_id);
 
         let _ = our_volume.sync().await;
@@ -1124,10 +1141,10 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let flush_cmd = tailtalk_packets::afp::FPFlushFork::parse(&command.data[2..]).unwrap();
+        let flush_cmd = parse_or_reply!(command, tailtalk_packets::afp::FPFlushFork, 2);
         debug!("AFP FPFlushFork req: fork_id={}", flush_cmd.fork_id);
 
-        let _ = our_volume.sync().await;
+        let _ = our_volume.sync_fork(flush_cmd.fork_id).await;
 
         debug!("AFP FPFlushFork resp: OK");
         command.send_reply(AspCommandResponse {
@@ -1143,7 +1160,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let read_cmd = FPRead::parse(&command.data[2..]).unwrap();
+        let read_cmd = parse_or_reply!(command, FPRead, 2);
         debug!(
             "AFP FPRead req: fork_id={}, offset={}, req_count={}",
             read_cmd.fork_id, read_cmd.offset, read_cmd.req_count
@@ -1256,8 +1273,8 @@ impl AspSession {
     ) -> anyhow::Result<()> {
         // Fork type is in bit 7 of the flag byte (command.data[1]):
         // 0x00 = data fork, 0x80 = resource fork.
-        let fork_type = ForkType::from(command.data[1] & 0x80);
-        let cmd = FPOpenFork::parse(&command.data[2..]).unwrap();
+        let fork_type = ForkType::from(command.data.get(1).copied().unwrap_or(0) & 0x80);
+        let cmd = parse_or_reply!(command, FPOpenFork, 2);
         let path_name_buf = afp_path_to_posix(cmd.path.as_str());
         debug!(
             "AFP FPOpenFork req: fork={:?}, dir_id={}, path={:?}, bitmap={:?}, access={:#06x}",
@@ -1270,6 +1287,7 @@ impl AspSession {
             .open_fork(
                 fork_type,
                 cmd.file_bitmap,
+                cmd.access_mode,
                 cmd.directory_id,
                 &path_name_buf,
                 &mut output_buf,
@@ -1307,7 +1325,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let fork_cmd = FPCloseFork::parse(&command.data[2..]).unwrap();
+        let fork_cmd = parse_or_reply!(command, FPCloseFork, 2);
         debug!("AFP FPCloseFork req: fork_id={}", fork_cmd.fork_id);
 
         match our_volume.close_fork(fork_cmd.fork_id).await {
@@ -1335,7 +1353,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let fork_cmd = FPSetForkParms::parse(&command.data[2..]).unwrap();
+        let fork_cmd = parse_or_reply!(command, FPSetForkParms, 2);
         debug!(
             "AFP FPSetForkParms req: fork_ref={}, data_len={:?}, rsrc_len={:?}",
             fork_cmd.fork_ref_num, fork_cmd.data_fork_length, fork_cmd.resource_fork_length
@@ -1366,7 +1384,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let cmd = FPGetForkParms::parse(&command.data[2..]).unwrap();
+        let cmd = parse_or_reply!(command, FPGetForkParms, 2);
         debug!(
             "AFP FPGetForkParms req: fork_id={}, bitmap={:?}",
             cmd.fork_id, cmd.file_bitmap
@@ -1401,7 +1419,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let mut enumerate = FPEnumerate::parse(&command.data[2..]).unwrap();
+        let mut enumerate = parse_or_reply!(command, FPEnumerate, 2);
         debug!(
             "AFP FPEnumerate req: dir_id={}, path={:?}, start={}, req_count={}, max_reply={}",
             enumerate.directory_id,
@@ -1507,7 +1525,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let get_icon = tailtalk_packets::afp::FPGetIcon::parse(&command.data[2..]).unwrap();
+        let get_icon = parse_or_reply!(command, tailtalk_packets::afp::FPGetIcon, 2);
         debug!(
             "AFP FPGetIcon req: dt_ref={}, creator={:#010x}, type={:#010x}, icon_type={}, size={}",
             get_icon.dt_ref_num,
@@ -1542,8 +1560,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let get_icon_info =
-            tailtalk_packets::afp::FPGetIconInfo::parse(&command.data[2..]).unwrap();
+        let get_icon_info = parse_or_reply!(command, tailtalk_packets::afp::FPGetIconInfo, 2);
         debug!(
             "AFP FPGetIconInfo req: dt_ref={}, creator={:#010x}, icon_type={}",
             get_icon_info.dt_ref_num,
@@ -1584,7 +1601,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let add_icon = tailtalk_packets::afp::FPAddIcon::parse(&command.data[2..]).unwrap();
+        let add_icon = parse_or_reply!(command, tailtalk_packets::afp::FPAddIcon, 2);
         debug!(
             "AFP FPAddIcon req: dt_ref={}, creator={:#010x}, type={:#010x}, icon_type={}, size={}",
             add_icon.dt_ref_num,
@@ -1631,7 +1648,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let add_comment = tailtalk_packets::afp::FPAddComment::parse(&command.data[2..]).unwrap();
+        let add_comment = parse_or_reply!(command, tailtalk_packets::afp::FPAddComment, 2);
         debug!(
             "AFP FPAddComment req: dir_id={}, path={:?}, comment={:?}",
             add_comment.directory_id,
@@ -1668,7 +1685,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let get_comment = tailtalk_packets::afp::FPGetComment::parse(&command.data[2..]).unwrap();
+        let get_comment = parse_or_reply!(command, tailtalk_packets::afp::FPGetComment, 2);
         debug!(
             "AFP FPGetComment req: dir_id={}, path={:?}",
             get_comment.directory_id,
@@ -1706,8 +1723,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let remove_comment =
-            tailtalk_packets::afp::FPRemoveComment::parse(&command.data[2..]).unwrap();
+        let remove_comment = parse_or_reply!(command, tailtalk_packets::afp::FPRemoveComment, 2);
         debug!(
             "AFP FPRemoveComment req: dir_id={}, path={:?}",
             remove_comment.directory_id,
@@ -1742,7 +1758,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let req = tailtalk_packets::afp::FPAddAPPL::parse(&command.data[2..]).unwrap();
+        let req = parse_or_reply!(command, tailtalk_packets::afp::FPAddAPPL, 2);
         debug!(
             "AFP FPAddAPPL req: dt_ref={}, creator={:#010x}, tag={:#010x}, dir_id={}, path={:?}",
             req.dt_ref_num,
@@ -1777,7 +1793,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let req = tailtalk_packets::afp::FPRemoveAPPL::parse(&command.data[2..]).unwrap();
+        let req = parse_or_reply!(command, tailtalk_packets::afp::FPRemoveAPPL, 2);
         debug!(
             "AFP FPRemoveAPPL req: dt_ref={}, creator={:#010x}, dir_id={}, path={:?}",
             req.dt_ref_num,
@@ -1811,7 +1827,7 @@ impl AspSession {
         command: crate::asp::AspCommand,
         our_volume: &mut Volume,
     ) -> anyhow::Result<()> {
-        let req = tailtalk_packets::afp::FPGetAPPL::parse(&command.data[2..]).unwrap();
+        let req = parse_or_reply!(command, tailtalk_packets::afp::FPGetAPPL, 2);
         debug!(
             "AFP FPGetAPPL req: dt_ref={}, creator={:#010x}, index={}",
             req.dt_ref_num,

@@ -15,6 +15,7 @@ use tokio::sync::{
 use crate::{
     DataLinkPacket, DataLinkProtocol, OutboundHandle,
     addressing::{Addressing, AddressingHandle, Node},
+    remote::RemoteClient,
     route_table::{NextHop, RouteTable},
 };
 
@@ -45,17 +46,84 @@ struct OutboundPacket {
     payload: Box<[u8]>,
 }
 
+#[derive(Debug, Clone)]
+enum DdpSender {
+    Local(mpsc::Sender<DdpCommand>),
+    Remote(RemoteClient),
+}
+
+/// Clone-able, send-only half of a [`DdpSocket`].
+///
+/// Obtained via [`DdpSocket::send_handle`]. Allows sending datagrams from a
+/// separate task while the socket's receive side lives elsewhere.
+#[derive(Debug, Clone)]
+pub struct DdpSocketSender {
+    sock_num: u8,
+    protocol: DdpProtocolType,
+    sender: DdpSender,
+}
+
+impl DdpSocketSender {
+    pub async fn send_to(&self, buf: &[u8], addr: DdpAddress) -> Result<(), Error> {
+        self.send_to_typed(buf, addr, None).await
+    }
+
+    /// Like [`Self::send_to`], but stamps `protocol` on this datagram instead
+    /// of the type the socket was opened with. Used to serve clients whose
+    /// socket API carries the DDP type per datagram rather than per socket.
+    pub async fn send_to_typed(
+        &self,
+        buf: &[u8],
+        addr: DdpAddress,
+        protocol: Option<DdpProtocolType>,
+    ) -> Result<(), Error> {
+        if buf.len() > 586 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "DDP payload length {} exceeds maximum allowed (586 bytes)",
+                    buf.len()
+                ),
+            ));
+        }
+        match &self.sender {
+            DdpSender::Local(sender) => {
+                let pkt = OutboundPacket {
+                    dest: addr,
+                    payload: buf.into(),
+                    src_sock: self.sock_num,
+                    protocol: protocol.unwrap_or(self.protocol),
+                };
+                sender.send(DdpCommand::SendPkt(pkt)).await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "DDP processor shut down")
+                })?;
+            }
+            DdpSender::Remote(client) => {
+                client
+                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf)
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct DdpSocket {
     sock_num: u8,
     protocol: DdpProtocolType,
     receiver: mpsc::Receiver<Packet>,
-    sender: mpsc::Sender<DdpCommand>,
+    sender: DdpSender,
 }
 
 impl Drop for DdpSocket {
     fn drop(&mut self) {
-        let _ = self.sender.try_send(DdpCommand::Deregister(self.sock_num));
+        match &self.sender {
+            DdpSender::Local(sender) => {
+                let _ = sender.try_send(DdpCommand::Deregister(self.sock_num));
+            }
+            DdpSender::Remote(client) => client.close_socket(self.sock_num),
+        }
     }
 }
 
@@ -85,18 +153,38 @@ impl DdpSocket {
             ));
         }
 
-        let pkt = OutboundPacket {
-            dest: addr,
-            payload: buf.into(),
-            src_sock: self.sock_num,
-            protocol: self.protocol,
-        };
-        self.sender
-            .send(DdpCommand::SendPkt(pkt))
-            .await
-            .expect("failed to ddp send");
+        match &self.sender {
+            DdpSender::Local(sender) => {
+                let pkt = OutboundPacket {
+                    dest: addr,
+                    payload: buf.into(),
+                    src_sock: self.sock_num,
+                    protocol: self.protocol,
+                };
+                sender.send(DdpCommand::SendPkt(pkt)).await.map_err(|_| {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "DDP processor shut down")
+                })?;
+            }
+            DdpSender::Remote(client) => {
+                client
+                    .send_datagram(self.sock_num, addr.addr, addr.sock, buf)
+                    .await?;
+            }
+        }
 
         Ok(())
+    }
+
+    /// Return a clone-able send-only handle for this socket.
+    ///
+    /// Use this to send datagrams from a separate task while the receive
+    /// side remains on the original `DdpSocket`.
+    pub fn send_handle(&self) -> DdpSocketSender {
+        DdpSocketSender {
+            sock_num: self.sock_num,
+            protocol: self.protocol,
+            sender: self.sender.clone(),
+        }
     }
 
     pub fn socket_num(&self) -> u8 {
@@ -138,7 +226,7 @@ impl DdpProcessor {
         tokio::spawn(async move { processor.run().await });
 
         DdpHandle {
-            command: command_tx,
+            inner: DdpHandleInner::Local(command_tx),
         }
     }
 
@@ -193,7 +281,7 @@ impl DdpProcessor {
             protocol,
             sock_num,
             receiver: rx,
-            sender: self.command_tx.clone(),
+            sender: DdpSender::Local(self.command_tx.clone()),
         };
 
         self.sockets.insert(sock_num, tx);
@@ -270,6 +358,40 @@ impl DdpProcessor {
         }
     }
 
+    /// Hand an outbound packet addressed to ourselves straight to the target
+    /// local socket, synthesizing the headers a wire reception would carry.
+    fn deliver_local(&mut self, packet: &OutboundPacket, our_addr: AppleTalkAddress) {
+        let headers = DdpHeaders {
+            hop_count: 0,
+            len: packet.payload.len() + DdpHeaders::LEN,
+            chksum: 0,
+            dest_network_num: packet.dest.addr.network_number,
+            dest_sock_num: packet.dest.sock,
+            dest_node_id: packet.dest.addr.node_number,
+            src_network_num: our_addr.network_number,
+            src_sock_num: packet.src_sock,
+            src_node_id: our_addr.node_number,
+            protocol_typ: packet.protocol,
+        };
+        let sock_num = packet.dest.sock;
+        if let Some(socket) = self.sockets.get(&sock_num) {
+            match socket.try_send(Packet {
+                headers,
+                payload: packet.payload.clone(),
+            }) {
+                Ok(_) => {}
+                Err(TrySendError::Closed(_)) => {
+                    self.sockets.remove(&sock_num);
+                }
+                Err(TrySendError::Full(_)) => {
+                    tracing::error!("sock is full!");
+                }
+            }
+        } else {
+            tracing::debug!("DDP: dropping loopback packet, no socket {}", sock_num);
+        }
+    }
+
     async fn handle_outbound(&mut self, packet: OutboundPacket) {
         // Network-wide broadcast {0, 255}: send on every configured interface so
         // all nodes on each cable receive it, regardless of their network number.
@@ -296,31 +418,97 @@ impl DdpProcessor {
             return;
         }
 
-        let dest_node = if packet.dest.addr.network_number == 0 {
-            if self.lt_addressing.is_none() {
-                tracing::error!(
-                    "DDP: dropping packet to {}.{} — LocalTalk (network 0) not configured",
-                    packet.dest.addr.network_number,
-                    packet.dest.addr.node_number,
-                );
-                return;
+        // A datagram addressed to one of our own interface addresses never
+        // comes back off the wire (interfaces don't receive their own
+        // frames), so deliver it to the local socket directly. Local clients
+        // rely on this, e.g. to reach an NBP responder on their own node.
+        // Address {0,0} ("any net, any node") conventionally means the node
+        // itself — the kernel AppleTalk stacks loop it back the same way.
+        let dest = packet.dest.addr;
+        let to_self = dest.network_number == 0 && dest.node_number == 0;
+        if let Some(et) = &self.et_addressing
+            && let Ok(our) = et.addr().await
+            && (to_self
+                || (dest.node_number == our.node_number
+                    && (dest.network_number == our.network_number || dest.network_number == 0)))
+        {
+            self.deliver_local(&packet, our);
+            return;
+        }
+        if let Some(lt) = &self.lt_addressing
+            && let Ok(our) = lt.addr().await
+            && (to_self
+                || (dest.node_number == our.node_number
+                    && (dest.network_number == our.network_number || dest.network_number == 0)))
+        {
+            self.deliver_local(&packet, our);
+            return;
+        }
+
+        // Routing happens here, not in the caller: first resolve the
+        // link-level next hop (the destination itself when it is on one of
+        // our cables or unknown, otherwise the responsible router from the
+        // route table), then pick whichever interface reaches that hop.
+        let hop = if dest.network_number == 0 {
+            // Network 0 is by definition on the local cable.
+            dest
+        } else {
+            match self.route_table.route_for(dest.network_number) {
+                Some(NextHop::Via(router)) => router,
+                // On our cable range, or no route known: try it directly.
+                Some(NextHop::Local) | None => dest,
             }
-            Node::LocalTalk(packet.dest.addr.node_number)
+        };
+
+        let dest_node = if hop.network_number == 0 {
+            // Network 0 is ambiguous between LocalTalk and nonextended
+            // (Phase 1) EtherTalk. With only one of the two configured,
+            // there's nothing to disambiguate — it must be that one. With
+            // both configured, check whether this node has actually been
+            // learned as an EtherTalk Phase 1 peer (e.g. from a packet it
+            // sent us); only fall back to LocalTalk if it hasn't.
+            match (&self.lt_addressing, &self.et_addressing) {
+                (Some(_), None) => Node::LocalTalk(hop.node_number),
+                (None, Some(et)) => match et.try_lookup(&hop) {
+                    Some(node) => node,
+                    None => {
+                        tracing::error!(
+                            "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0 but no EtherTalk Phase 1 binding is cached for it",
+                            dest.network_number, dest.node_number,
+                            hop.network_number, hop.node_number,
+                        );
+                        return;
+                    }
+                },
+                (Some(_), Some(et)) => et.try_lookup(&hop).unwrap_or(Node::LocalTalk(hop.node_number)),
+                (None, None) => {
+                    tracing::error!(
+                        "DDP: dropping packet to {}.{} — next hop {}.{} is on network 0, but no interfaces are configured",
+                        dest.network_number, dest.node_number,
+                        hop.network_number, hop.node_number,
+                    );
+                    return;
+                }
+            }
         } else {
             let Some(et) = &self.et_addressing else {
                 tracing::error!(
-                    "DDP: dropping packet to {}.{} — EtherTalk not configured",
-                    packet.dest.addr.network_number,
-                    packet.dest.addr.node_number,
+                    "DDP: dropping packet to {}.{} — next hop {}.{} needs EtherTalk, which is not configured",
+                    dest.network_number, dest.node_number,
+                    hop.network_number, hop.node_number,
                 );
                 return;
             };
-            // If the route table has an explicit via-router for this network,
-            // forward to the router's address instead of resolving the destination directly.
-            let next_hop = self.route_table.route_for(packet.dest.addr.network_number);
-            match next_hop {
-                Some(NextHop::Via(router)) => et.lookup(router).await.expect("unknown router addr"),
-                _ => et.lookup(packet.dest.addr).await.expect("unknown addr"),
+            match et.lookup(hop).await {
+                Ok(node) => node,
+                Err(e) => {
+                    tracing::error!(
+                        "DDP: dropping packet to {}.{} — AARP lookup for next hop {}.{} failed: {e}",
+                        dest.network_number, dest.node_number,
+                        hop.network_number, hop.node_number,
+                    );
+                    return;
+                }
             }
         };
 
@@ -421,43 +609,64 @@ enum DdpCommand {
     Deregister(SockNum),
 }
 
+/// Handle to the DDP layer.
 #[derive(Clone)]
 pub struct DdpHandle {
-    command: mpsc::Sender<DdpCommand>,
+    inner: DdpHandleInner,
+}
+
+#[derive(Clone)]
+enum DdpHandleInner {
+    Local(mpsc::Sender<DdpCommand>),
+    Remote(RemoteClient),
 }
 
 impl DdpHandle {
+    /// Create a handle whose sockets live in a remote daemon.
+    pub(crate) fn remote(client: RemoteClient) -> Self {
+        Self {
+            inner: DdpHandleInner::Remote(client),
+        }
+    }
+
     pub async fn new_sock(
         &self,
         protocol: DdpProtocolType,
         sock_num: Option<SockNum>,
     ) -> Result<DdpSocket, Error> {
-        let (tx, rx) = oneshot::channel();
+        match &self.inner {
+            DdpHandleInner::Local(command) => {
+                let (tx, rx) = oneshot::channel();
 
-        let sock_args = SockArgs {
-            protocol,
-            sock_num,
-            response: tx,
-        };
+                let sock_args = SockArgs {
+                    protocol,
+                    sock_num,
+                    response: tx,
+                };
 
-        self.command
-            .send(DdpCommand::NewSocket(sock_args))
-            .await
-            .expect("failed to send");
+                command
+                    .send(DdpCommand::NewSocket(sock_args))
+                    .await
+                    .expect("failed to send");
 
-        rx.await.expect("no oneshot response")
+                rx.await.expect("no oneshot response")
+            }
+            DdpHandleInner::Remote(client) => {
+                let (sock_num, receiver) = client.open_socket(protocol, sock_num).await?;
+                Ok(DdpSocket {
+                    sock_num,
+                    protocol,
+                    receiver,
+                    sender: DdpSender::Remote(client.clone()),
+                })
+            }
+        }
     }
 
     pub fn received_pkt(&self, pkt: &[u8], source: AppleTalkAddressSource, source_mac: [u8; 6]) {
         if let Ok(headers) = DdpHeaders::parse(pkt) {
             let payload = pkt[DdpHeaders::LEN..headers.len.min(pkt.len())].into();
-
-            let _ = self.command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
-                headers,
-                payload,
-                source,
-                source_mac,
-            }));
+            self.received_parsed_pkt(headers, payload, source, source_mac);
         }
     }
 
@@ -468,11 +677,15 @@ impl DdpHandle {
         source: AppleTalkAddressSource,
         source_mac: [u8; 6],
     ) {
-        let _ = self.command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
-            headers,
-            payload,
-            source,
-            source_mac,
-        }));
+        // Only meaningful when the underlay is in-process; a remote daemon
+        // receives packets from its own interfaces.
+        if let DdpHandleInner::Local(command) = &self.inner {
+            let _ = command.try_send(DdpCommand::ReceivedPkt(DdpPacket {
+                headers,
+                payload,
+                source,
+                source_mac,
+            }));
+        }
     }
 }
