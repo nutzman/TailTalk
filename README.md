@@ -1,20 +1,37 @@
 # TailTalk
 
-TailTalk is designed as a "toolkit" for building fully userspace AppleTalk implementations on Linux, and later Mac OS and Windows
-systems. It is built from scratch with zero dependencies on Netatalk or any kernel drivers - All it needs is a raw socket and 
-patience for grumpy old computers. It provides a complete AppleTalk stack, with multiple copies of it able to run on the same machine 
+[![Crates.io][crates-badge]][crates-url] [![docs.rs][docs-badge]][docs-url]
+
+[crates-badge]: https://img.shields.io/crates/v/tailtalk.svg
+[crates-url]: https://crates.io/crates/tailtalk
+[docs-badge]: https://img.shields.io/docsrs/tailtalk.svg
+[docs-url]: https://docs.rs/tailtalk/latest/tailtalk/
+
+TailTalk is designed as a "toolkit" for building fully userspace AppleTalk implementations on Linux, Mac OS and Windows
+systems via EtherTalk or LocalTalk networks. It is built from scratch with zero dependencies on Netatalk or any kernel
+drivers - All it needs is a raw socket and/or TashTalk compatible device (for LocalTalk) and patience for grumpy old computers.
+It provides a complete AppleTalk stack, with multiple copies of it able to run on the same machine
 at the same time.
 
 I started this project to be able to copy files to/from my old Macs, print to LaserWriters and networked StyleWriters, and be able
-to write modern async software to communicate with them. It is not meant to support the full feature set of Netatalk, but rather 
-communicate with small networks of a couple Macs and printers. Zones, routing, and other similar features are beyond the scope
-of this project.
+to write modern async software to communicate with them. Currently TailTalk only works in a routerless setup - work is in progress
+to make it gracefully join router present networks but it is not yet in the mainline code.
 
-Each part of the stack is meant to be as "zero config" as possible, just like running on a Mac of the era. Just plug it in, 
+Each part of the stack is meant to be as "zero config" as possible, just like running on a Mac of the era. Just plug it in,
 launch and things should just work without any fuss.
 
-This project is very much a work in progress prototype, so expect bugs and missing features. `expect` and `unwrap` are used
-far too often during my prototyping and will be replaced with proper error handling in time.
+This project is very much a work in progress prototype, so expect bugs and missing features.
+
+## TailTalk GUI
+
+This is the current user facing program for use with TashTalk USB. It includes an AFP server which should work with just about
+every Mac that shipped with a LocalTalk port. It also can import Stuff-It archives and floppy disk images and load them in to
+the share path preserving the resource forks and make them available to remote clients.
+
+It additionally supports sharing LocalTalk capable LaserWriters and StyleWriters to modern networks as AirPrint / IPP printers,
+and sharing modern printers to classic Macs. The latest release can be found here:
+
+[https://github.com/FeralFirmware/TailTalk/releases/latest](https://github.com/FeralFirmware/TailTalk/releases/latest)
 
 ## Features
 
@@ -27,7 +44,7 @@ Packet parsers and fully async APIs for almost all the major AppleTalk protocols
 - Printer Access Protocol (PAP)
 - AppleTalk Session Protocol (ASP)
 - AppleTalk Filing Protocol (AFP)
-- AppleTalk Data Stream Protocol (ADSP - untested) 
+- AppleTalk Data Stream Protocol
 
 It additionally supports running with TashTalk for LocalTalk Macs.
 
@@ -75,7 +92,6 @@ cargo packager --release -f nsis -p tailtalk-gui
 ```
 
 The resulting bundle will be placed in dist/. 
-
 
 ## TashTalk USB
 
@@ -136,11 +152,6 @@ When the AsanteTalk is first powered on it "listens" for incoming packets on the
 side before choosing what EtherTalk phase to operate under. If it doesn't see any EtherTalk Phase 2 packets it will default to
 Phase 1. TailTalk supports Phase 1 and this works just fine for LaserWriters, NBP and some basic operations but does
 not work with AFP (The Mac will discover the AFP TailTalk server but our responses appear to be dropped).
-
-## Known Issues
-
-* Multiple AFP sessions are not properly supported yet - whilst it can support two or more clients at once
-  the server can/will ask strangely. 
 
 ## Contributing
 

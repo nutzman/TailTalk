@@ -1,5 +1,7 @@
 ## Overview
 
+[![I sell on Tindie](https://static.tindie.com/badges/tindie-mediums.png)](https://www.tindie.com/stores/feralfirmware/?ref=offsite_badges&utm_source=sellers_FeralFirmware&utm_medium=badges&utm_campaign=badge_medium)
+
 This device us a USB-ified version of [TashTalk by Tashtari](https://github.com/lampmerchant/tashtalk) using the original PIC12F1840 and a CP2102N USB-to-UART chip.
 
 It uses the same firmware (v2.1.3 as of time of writing) from the original project, an an SN65HVD1473 transceiver from TI so it can be
